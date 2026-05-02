@@ -1695,235 +1695,158 @@ class CodeGen:
     def prune_dead_functions(self, program):
         """
         Eliminação de Funções Mortas (Dead Function Elimination)
-        com Poda Inteligente de Roteamento de Syscalls para o CompSysLab.
+        Arquitetura Definitiva (Two-Pass Call Graph)
         """
         all_functions = {f.name: f for f in program.items if isinstance(f, Function)}
 
-        # =================================================================
-        # HACK DO COMPSYSLAB: PODA DE SYSCALLS (OS Kernel Space)
-        # =================================================================
-        
-        # 1. Mapa de IDs das Syscalls para os nomes dos Wrappers no User Space
         syscall_wrappers = {
             1: 'exit', 2: 'wait', 3: 'kill', 4: 'sem_lock', 5: 'sem_unlock',
-            6: 'spawn',
-            7: 'sys_mutex_trylock', 8: 'mutex_unlock',
+            6: 'spawn', 7: 'sys_mutex_trylock', 8: 'mutex_unlock',
             9: 'yield', 10: 'print_char', 11: 'read_char', 12: 'sleep',
             13: 'alarm', 14: 'pause', 15: 'signal', 16: 'sigreturn', 17: 'get_signal',
             20: 'write_pipe', 21: 'read_pipe', 25: 'shmget',
-            27: 'msg_send', 28: 'msg_recv'
+            27: 'msg_send', 28: 'msg_recv', 29: 'thread_create'
         }
 
-        used_wrappers = set()
+        # Estas funções do Kernel podem ser apagadas com segurança se o wrapper não for usado.
+        # Nota: kernel_kill, kernel_exit, kernel_print_char e kernel_read_char 
+        # ficam fora da lista de deleção porque o SO depende delas internamente.
+        kernel_mappings = {
+            'write_pipe': 'kernel_write_pipe', 'read_pipe': 'kernel_read_pipe',
+            'shmget': 'kernel_shmget', 'msg_send': 'kernel_msg_send', 'msg_recv': 'kernel_msg_recv',
+            'spawn': 'kernel_spawn', 'thread_create': 'kernel_thread_create',
+            'wait': 'kernel_wait', 'sleep': 'kernel_sleep',
+            'alarm': 'kernel_alarm', 'pause': 'kernel_pause', 'signal': 'kernel_signal',
+            'sigreturn': 'kernel_sigreturn', 'get_signal': 'kernel_get_signal',
+            'sem_lock': 'kernel_sem_lock', 'sem_unlock': 'kernel_sem_unlock',
+            'sys_mutex_trylock': 'kernel_mutex_trylock', 'mutex_unlock': 'kernel_mutex_unlock'
+        }
 
-        # 2. Rastreador para descobrir quais syscalls as Tasks realmente usam
-        def scan_used_wrappers(node):
-            if node is None or isinstance(node, (int, str, bool, float)): return
-            if isinstance(node, list):
-                for item in node: scan_used_wrappers(item)
-                return
-
-            if isinstance(node, Call) and isinstance(node.callee, Var):
-                if node.callee.name in syscall_wrappers.values():
-                    used_wrappers.add(node.callee.name)
-
-            if isinstance(node, Asm):
-                for w in syscall_wrappers.values():
-                    if re.search(rf'\b{w}\b', node.code):
-                        used_wrappers.add(w)
-
-            if hasattr(node, '__dict__'):
-                for key, val in vars(node).items():
-                    if key not in ('lineno', 'colno', 'end_lineno', 'end_colno'):
-                        scan_used_wrappers(val)
-
-        # Varre todas as funções EXCETO a main (que é o SO)
-        for f_name, f_node in all_functions.items():
-            if f_name != 'main': 
-                scan_used_wrappers(f_node.body)
-
-        # --- DESVINCULAÇÃO COMPLETA DE HANDLERS DO KERNEL ---
+        # ---------------------------------------------------------
+        # FASE 1: DESCOBRIR O QUE O USUÁRIO ALCANÇA (User Space Root)
+        # ---------------------------------------------------------
+        user_reachable = set()
         
-        # IPC (Pipes, Memória Compartilhada e Mensagens)
-        if 'write_pipe' not in used_wrappers and 'kernel_write_pipe' in all_functions:
-            del all_functions['kernel_write_pipe']
-        if 'read_pipe' not in used_wrappers and 'kernel_read_pipe' in all_functions:
-            del all_functions['kernel_read_pipe']
-        if 'shmget' not in used_wrappers and 'kernel_shmget' in all_functions:
-            del all_functions['kernel_shmget']
-        if 'msg_send' not in used_wrappers and 'kernel_msg_send' in all_functions:
-            del all_functions['kernel_msg_send']
-        if 'msg_recv' not in used_wrappers and 'kernel_msg_recv' in all_functions:
-            del all_functions['kernel_msg_recv']
-
-        # Processos e Sincronização
-        if 'spawn' not in used_wrappers and 'kernel_spawn' in all_functions:
-            del all_functions['kernel_spawn']
-        if 'wait' not in used_wrappers and 'kernel_wait' in all_functions:
-            del all_functions['kernel_wait']
-        if 'sem_lock' not in used_wrappers and 'kernel_sem_lock' in all_functions:
-            del all_functions['kernel_sem_lock']
-        if 'sem_unlock' not in used_wrappers and 'kernel_sem_unlock' in all_functions:
-            del all_functions['kernel_sem_unlock']
-        if 'sys_mutex_trylock' not in used_wrappers and 'kernel_mutex_trylock' in all_functions:
-            del all_functions['kernel_mutex_trylock']
-        if 'mutex_unlock' not in used_wrappers and 'kernel_mutex_unlock' in all_functions:
-            del all_functions['kernel_mutex_unlock']
-
-        # Sinais e Tempo
-        if 'signal' not in used_wrappers and 'kernel_signal' in all_functions:
-            del all_functions['kernel_signal']
-        if 'sigreturn' not in used_wrappers and 'kernel_sigreturn' in all_functions:
-            del all_functions['kernel_sigreturn']
-        if 'get_signal' not in used_wrappers and 'kernel_get_signal' in all_functions:
-            del all_functions['kernel_get_signal']
-        # ~ if 'kill' not in used_wrappers and 'kernel_kill' in all_functions:
-            # ~ del all_functions['kernel_kill']
-        if 'sleep' not in used_wrappers and 'kernel_sleep' in all_functions:
-            del all_functions['kernel_sleep']
-        if 'alarm' not in used_wrappers and 'kernel_alarm' in all_functions:
-            del all_functions['kernel_alarm']
-        if 'pause' not in used_wrappers and 'kernel_pause' in all_functions:
-            del all_functions['kernel_pause']
-
-        # I/O Básico
-        if 'print_char' not in used_wrappers and 'kernel_print_char' in all_functions:
-            del all_functions['kernel_print_char']
-        if 'read_char' not in used_wrappers and 'kernel_read_char' in all_functions:
-            del all_functions['kernel_read_char']
-
-        # --- NOVO: Podador Recursivo da AST ---
-        def contains_var(node, var_name):
-            if node is None or isinstance(node, (int, str, bool, float)): return False
-            if isinstance(node, list): return any(contains_var(n, var_name) for n in node)
-            if isinstance(node, Var) and node.name == var_name: return True
+        # Ponto de Entrada Estrito: Pega funções prefixadas com 'task_'
+        user_worklist = [f for f in all_functions.keys() if f.startswith('task_')]
+        if not user_worklist: user_worklist = ['main'] # Fallback de segurança
+        
+        def get_refs(node):
+            refs = set()
+            if node is None or isinstance(node, (int, str, bool, float)): return refs
+            if isinstance(node, list):
+                for x in node: refs.update(get_refs(x))
+                return refs
+            
+            # Coleta referências de nós AST (Chamadas explícitas e Variáveis passadas por ponteiro)
+            if isinstance(node, Var) and node.name in all_functions:
+                refs.add(node.name)
+            
+            # Coleta chamadas ocultas no Assembly (Ex: asm("MOV thread_incremento"))
+            if isinstance(node, Asm):
+                for word in re.findall(r'[A-Za-z_]\w*', node.code):
+                    if word in all_functions: refs.add(word)
+                    
             if hasattr(node, '__dict__'):
-                return any(contains_var(v, var_name) for k, v in vars(node).items() if k not in ('lineno', 'colno', 'end_lineno', 'end_colno'))
-            return False
+                for k, v in vars(node).items():
+                    if k not in ('lineno', 'colno', 'end_lineno', 'end_colno'):
+                        refs.update(get_refs(v))
+            return refs
 
-        def prune_ast_blocks(body_list, used_wrappers):
-            if not isinstance(body_list, list): return
-            
-            new_body = []
-            for stmt in body_list:
-                is_dead = False
-                if isinstance(stmt, (If, While)):
-                    cond = getattr(stmt, 'condition', None)
-                    
-                    # Poda Semântica de Recursos Desativados em TODO o SO
-                    if 'signal' not in used_wrappers and 'kill' not in used_wrappers and contains_var(cond, 'pending_signal'):
-                        is_dead = True
-                    elif 'sleep' not in used_wrappers and contains_var(cond, 'STATE_SLEEPING'):
-                        is_dead = True
-                    elif 'alarm' not in used_wrappers and contains_var(cond, 'alarm_tick'):
-                        is_dead = True
-                            
-                if not is_dead:
-                    if hasattr(stmt, 'body'):
-                        prune_ast_blocks(getattr(stmt, 'body'), used_wrappers)
-                    if hasattr(stmt, 'then_body'):
-                        prune_ast_blocks(getattr(stmt, 'then_body'), used_wrappers)
-                    if hasattr(stmt, 'else_body'):
-                        prune_ast_blocks(getattr(stmt, 'else_body'), used_wrappers)
-                    
-                    new_body.append(stmt)
-            
-            body_list[:] = new_body
+        # Mapeia as dependências de todas as funções (Cache de Performance)
+        deps_cache = {f: get_refs(all_functions[f].body) for f in all_functions}
+        
+        # Percorre apenas a teia do Usuário
+        while user_worklist:
+            curr = user_worklist.pop(0)
+            if curr in all_functions and curr not in user_reachable:
+                user_reachable.add(curr)
+                user_worklist.extend(list(deps_cache[curr]))
 
-        # Aplica a poda de blocos inativos em TODAS as funções do SO
-        for f_name, f_node in all_functions.items():
-            prune_ast_blocks(f_node.body, used_wrappers)
+        # ---------------------------------------------------------
+        # FASE 2: LISTA NEGRA E EXCLUSÃO DO DICIONÁRIO
+        # ---------------------------------------------------------
+        functions_to_delete = set()
+        
+        # O Wrapper de C (ex: msg_send) não foi usado? Vai pra guilhotina.
+        for sys_id, wrapper in syscall_wrappers.items():
+            if wrapper not in user_reachable:
+                functions_to_delete.add(wrapper)
+                # O Handler do Kernel correspondente também morre
+                if wrapper in kernel_mappings:
+                    functions_to_delete.add(kernel_mappings[wrapper])
 
+        # Se os Handlers morreram, os Inits (Boot) também morrem
+        if 'kernel_shmget' in functions_to_delete:
+            functions_to_delete.add('init_ipc_shm')
+        if 'kernel_msg_send' in functions_to_delete and 'kernel_msg_recv' in functions_to_delete:
+            functions_to_delete.add('init_ipc_mailbox')
 
-        # 3. PODA CIRÚRGICA AVANÇADA NA MAIN()
+        # Apaga tudo do dicionário global
+        for f in functions_to_delete:
+            if f in all_functions:
+                del all_functions[f]
+
+        # ---------------------------------------------------------
+        # FASE 3: PODA CIRÚRGICA DA MAIN (Roteamento e Inicialização)
+        # ---------------------------------------------------------
         if 'main' in all_functions:
             main_func = all_functions['main']
             new_main_body = []
             
             for stmt in main_func.body:
-                is_dead_syscall = False
+                is_dead = False
                 
-                # A) Poda o Roteamento das Syscalls (Ifs)
+                # Deleta Roteamento (IF) no Dispatcher se o wrapper estiver morto
                 if isinstance(stmt, If) and isinstance(stmt.condition, BinaryOp) and stmt.condition.op == '==':
-                    left = stmt.condition.left
-                    right = stmt.condition.right
-                    
+                    left, right = stmt.condition.left, stmt.condition.right
                     if getattr(left, 'name', '') == 'tmp_sys_id' and isinstance(right, Const):
                         try:
                             sys_id = int(right.value)
-                            if sys_id in syscall_wrappers:
-                                wrapper_name = syscall_wrappers[sys_id]
-                                if wrapper_name not in used_wrappers:
-                                    is_dead_syscall = True 
+                            # Linhas de vida (1, 9, 10, 11) permanecem blindadas
+                            if sys_id in syscall_wrappers and sys_id not in (1, 9, 10, 11):
+                                if syscall_wrappers[sys_id] in functions_to_delete:
+                                    is_dead = True
                         except: pass
                 
-                # B) Poda as Inicializações do Boot (Memória Compartilhada e Mailbox)
+                # Deleta Chamadas de Inicialização mortas no boot
                 if isinstance(stmt, Call) and isinstance(stmt.callee, Var):
-                    callee_name = stmt.callee.name
-                    if callee_name == 'init_ipc_shm' and 'shmget' not in used_wrappers:
-                        is_dead_syscall = True
-                    if callee_name == 'init_ipc_mailbox' and 'msg_send' not in used_wrappers and 'msg_recv' not in used_wrappers:
-                        is_dead_syscall = True
+                    if stmt.callee.name in functions_to_delete:
+                        is_dead = True
                 
-                if not is_dead_syscall:
+                if not is_dead:
                     new_main_body.append(stmt)
-            
+                    
             main_func.body = new_main_body
 
-        # =================================================================
-        # FIM DA PODA DE SYSCALLS. O CALL GRAPH NORMAL ASSUME O CONTROLE!
-        # =================================================================
-
-        reachable = set()
-        worklist = ['main'] # A main é sempre a raiz de execução
-
-        def find_refs(node):
-            refs = set()
-            if node is None or isinstance(node, (int, str, bool, float)):
-                return refs
-            if isinstance(node, list):
-                for item in node: refs.update(find_refs(item))
-                return refs
-
-            if hasattr(node, '__dict__'):
-                if isinstance(node, Asm):
-                    words = re.findall(r'[A-Za-z_]\w*', node.code)
-                    for word in words:
-                        if word in all_functions:
-                            refs.add(word)
-
-                if isinstance(node, Call) and isinstance(node.callee, Var):
-                     if node.callee.name in all_functions:
-                          refs.add(node.callee.name)
-                          
-                if isinstance(node, Var) and node.name in all_functions:
-                     refs.add(node.name)
-
-                for key, val in vars(node).items():
-                    if key not in ('lineno', 'colno', 'end_lineno', 'end_colno'):
-                        refs.update(find_refs(val))
-            return refs
-
-        dependencies = {}
-        for f_name, f_node in all_functions.items():
-            dependencies[f_name] = find_refs(f_node.body)
-
-        for item in program.items:
-            if not isinstance(item, Function):
-                worklist.extend(list(find_refs(item)))
-
-        while worklist:
-            curr = worklist.pop(0)
-            if curr in all_functions and curr not in reachable:
-                reachable.add(curr)
-                worklist.extend(list(dependencies[curr]))
-
-        original_count = len(all_functions)
+        # ---------------------------------------------------------
+        # FASE 4: CALL GRAPH FINAL DO SO INTEIRO
+        # ---------------------------------------------------------
+        final_reachable = set()
+        final_worklist = ['main']
         
+        # As tasks de usuário são raízes independentes que o Kernel chama via ponteiros
+        user_tasks = [f for f in all_functions.keys() if f.startswith('task_')]
+        final_worklist.extend(user_tasks)
+        
+        # Recalcula as dependências da main, pois ela sofreu poda cirúrgica
+        deps_cache['main'] = get_refs(all_functions['main'].body)
+        
+        while final_worklist:
+            curr = final_worklist.pop(0)
+            if curr in all_functions and curr not in final_reachable:
+                final_reachable.add(curr)
+                final_worklist.extend(list(deps_cache[curr]))
+
+        # ---------------------------------------------------------
+        # FASE 5: RECONSTRUÇÃO DA ÁRVORE SINTÁTICA
+        # ---------------------------------------------------------
+        original_count = len([f for f in program.items if isinstance(f, Function)])
+        
+        # Mantém Globais e Structs, mas destrói qualquer Função fora do 'final_reachable'
         program.items = [
             item for item in program.items 
-            if not isinstance(item, Function) or item.name in reachable
+            if not isinstance(item, Function) or item.name in final_reachable
         ]
         
-        dead_count = original_count - len(reachable)
-        return dead_count
+        return original_count - len([f for f in program.items if isinstance(f, Function)])
