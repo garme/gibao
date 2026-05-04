@@ -1695,8 +1695,9 @@ class CodeGen:
     def prune_dead_functions(self, program):
         """
         Eliminação de Funções Mortas (Dead Function Elimination)
-        Arquitetura Definitiva (Two-Pass Call Graph)
+        Arquitetura com "Hard Link" entre User Space e Kernel Space
         """
+        original_func_names = [f.name for f in program.items if isinstance(f, Function)]
         all_functions = {f.name: f for f in program.items if isinstance(f, Function)}
 
         syscall_wrappers = {
@@ -1708,9 +1709,6 @@ class CodeGen:
             27: 'msg_send', 28: 'msg_recv', 29: 'thread_create'
         }
 
-        # Estas funções do Kernel podem ser apagadas com segurança se o wrapper não for usado.
-        # Nota: kernel_kill, kernel_exit, kernel_print_char e kernel_read_char 
-        # ficam fora da lista de deleção porque o SO depende delas internamente.
         kernel_mappings = {
             'write_pipe': 'kernel_write_pipe', 'read_pipe': 'kernel_read_pipe',
             'shmget': 'kernel_shmget', 'msg_send': 'kernel_msg_send', 'msg_recv': 'kernel_msg_recv',
@@ -1719,18 +1717,19 @@ class CodeGen:
             'alarm': 'kernel_alarm', 'pause': 'kernel_pause', 'signal': 'kernel_signal',
             'sigreturn': 'kernel_sigreturn', 'get_signal': 'kernel_get_signal',
             'sem_lock': 'kernel_sem_lock', 'sem_unlock': 'kernel_sem_unlock',
-            'sys_mutex_trylock': 'kernel_mutex_trylock', 'mutex_unlock': 'kernel_mutex_unlock'
+            'sys_mutex_trylock': 'kernel_mutex_trylock', 'mutex_unlock': 'kernel_mutex_unlock',
+            'print_char': 'kernel_print_char', 'read_char': 'kernel_read_char',
+            'exit': 'kernel_exit'
         }
 
         # ---------------------------------------------------------
         # FASE 1: DESCOBRIR O QUE O USUÁRIO ALCANÇA (User Space Root)
         # ---------------------------------------------------------
         user_reachable = set()
-        
-        # Ponto de Entrada Estrito: Pega funções prefixadas com 'task_'
         user_worklist = [f for f in all_functions.keys() if f.startswith('task_')]
-        if not user_worklist: user_worklist = ['main'] # Fallback de segurança
+        if not user_worklist: user_worklist = ['main']
         
+        # Scanner recursivo universal
         def get_refs(node):
             refs = set()
             if node is None or isinstance(node, (int, str, bool, float)): return refs
@@ -1738,11 +1737,9 @@ class CodeGen:
                 for x in node: refs.update(get_refs(x))
                 return refs
             
-            # Coleta referências de nós AST (Chamadas explícitas e Variáveis passadas por ponteiro)
             if isinstance(node, Var) and node.name in all_functions:
                 refs.add(node.name)
             
-            # Coleta chamadas ocultas no Assembly (Ex: asm("MOV thread_incremento"))
             if isinstance(node, Asm):
                 for word in re.findall(r'[A-Za-z_]\w*', node.code):
                     if word in all_functions: refs.add(word)
@@ -1753,10 +1750,8 @@ class CodeGen:
                         refs.update(get_refs(v))
             return refs
 
-        # Mapeia as dependências de todas as funções (Cache de Performance)
         deps_cache = {f: get_refs(all_functions[f].body) for f in all_functions}
         
-        # Percorre apenas a teia do Usuário
         while user_worklist:
             curr = user_worklist.pop(0)
             if curr in all_functions and curr not in user_reachable:
@@ -1768,68 +1763,59 @@ class CodeGen:
         # ---------------------------------------------------------
         functions_to_delete = set()
         
-        # O Wrapper de C (ex: msg_send) não foi usado? Vai pra guilhotina.
         for sys_id, wrapper in syscall_wrappers.items():
             if wrapper not in user_reachable:
                 functions_to_delete.add(wrapper)
-                # O Handler do Kernel correspondente também morre
                 if wrapper in kernel_mappings:
                     functions_to_delete.add(kernel_mappings[wrapper])
 
-        # Se os Handlers morreram, os Inits (Boot) também morrem
         if 'kernel_shmget' in functions_to_delete:
             functions_to_delete.add('init_ipc_shm')
         if 'kernel_msg_send' in functions_to_delete and 'kernel_msg_recv' in functions_to_delete:
             functions_to_delete.add('init_ipc_mailbox')
 
-        # Apaga tudo do dicionário global
         for f in functions_to_delete:
             if f in all_functions:
                 del all_functions[f]
 
         # ---------------------------------------------------------
-        # FASE 3: PODA CIRÚRGICA DA MAIN (Roteamento e Inicialização)
+        # FASE 3: PODA CIRÚRGICA DA MAIN
         # ---------------------------------------------------------
         if 'main' in all_functions:
             main_func = all_functions['main']
             new_main_body = []
-            
             for stmt in main_func.body:
                 is_dead = False
-                
-                # Deleta Roteamento (IF) no Dispatcher se o wrapper estiver morto
                 if isinstance(stmt, If) and isinstance(stmt.condition, BinaryOp) and stmt.condition.op == '==':
                     left, right = stmt.condition.left, stmt.condition.right
                     if getattr(left, 'name', '') == 'tmp_sys_id' and isinstance(right, Const):
                         try:
                             sys_id = int(right.value)
-                            # Linhas de vida (1, 9, 10, 11) permanecem blindadas
-                            if sys_id in syscall_wrappers and sys_id not in (1, 9, 10, 11):
-                                if syscall_wrappers[sys_id] in functions_to_delete:
-                                    is_dead = True
+                            if sys_id in syscall_wrappers and syscall_wrappers[sys_id] in functions_to_delete:
+                                is_dead = True
                         except: pass
                 
-                # Deleta Chamadas de Inicialização mortas no boot
                 if isinstance(stmt, Call) and isinstance(stmt.callee, Var):
                     if stmt.callee.name in functions_to_delete:
                         is_dead = True
                 
                 if not is_dead:
                     new_main_body.append(stmt)
-                    
             main_func.body = new_main_body
 
         # ---------------------------------------------------------
-        # FASE 4: CALL GRAPH FINAL DO SO INTEIRO
+        # FASE 4: CALL GRAPH FINAL (COM "HARD LINK")
         # ---------------------------------------------------------
         final_reachable = set()
         final_worklist = ['main']
+        final_worklist.extend([f for f in all_functions.keys() if f.startswith('task_')])
         
-        # As tasks de usuário são raízes independentes que o Kernel chama via ponteiros
-        user_tasks = [f for f in all_functions.keys() if f.startswith('task_')]
-        final_worklist.extend(user_tasks)
+        # O SEGREDO ESTÁ AQUI: Injeção forçada de sobrevivência!
+        # Se a função do usuário sobreviveu, o Kernel DEVE sobreviver, custe o que custar.
+        for wrapper, k_handler in kernel_mappings.items():
+            if wrapper in user_reachable and k_handler in all_functions:
+                final_worklist.append(k_handler)
         
-        # Recalcula as dependências da main, pois ela sofreu poda cirúrgica
         deps_cache['main'] = get_refs(all_functions['main'].body)
         
         while final_worklist:
@@ -1839,14 +1825,48 @@ class CodeGen:
                 final_worklist.extend(list(deps_cache[curr]))
 
         # ---------------------------------------------------------
-        # FASE 5: RECONSTRUÇÃO DA ÁRVORE SINTÁTICA
+        # FASE 5: RECONSTRUÇÃO DA ÁRVORE SINTÁTICA E RELATÓRIO
         # ---------------------------------------------------------
-        original_count = len([f for f in program.items if isinstance(f, Function)])
-        
-        # Mantém Globais e Structs, mas destrói qualquer Função fora do 'final_reachable'
         program.items = [
             item for item in program.items 
             if not isinstance(item, Function) or item.name in final_reachable
         ]
+
+        surviving_func_names = [f.name for f in program.items if isinstance(f, Function)]
+        pruned_func_names = set(original_func_names) - set(surviving_func_names)
         
-        return original_count - len([f for f in program.items if isinstance(f, Function)])
+        report_lines = [
+            "=================================================================",
+            "         CAFE OS (ESMERIX) - RELATÓRIO DE OTIMIZAÇÃO DCE",
+            "=================================================================",
+            f"Total de funções originais analisadas : {len(original_func_names)}",
+            f"Total de funções mantidas no binário  : {len(surviving_func_names)}",
+            f"Total de funções podadas (mortas)     : {len(pruned_func_names)}",
+            "\n=================================================================",
+            "--- FUNÇÕES PODADAS (REMOVIDAS DO KERNEL E USER SPACE) ---",
+            "================================================================="
+        ]
+        
+        if not pruned_func_names:
+            report_lines.append(" Nenhuma função foi podada.")
+        else:
+            for fn in sorted(pruned_func_names):
+                report_lines.append(f" [-] {fn}")
+                
+        report_lines.extend([
+            "\n=================================================================",
+            "--- FUNÇÕES MANTIDAS (COMPILADAS NO BINÁRIO FINAL) ---",
+            "================================================================="
+        ])
+        
+        for fn in sorted(surviving_func_names):
+            report_lines.append(f" [+] {fn}")
+            
+        try:
+            with open("cafe_os_dce_report.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(report_lines))
+            print(f"[*] Relatório de otimização gerado: 'cafe_os_dce_report.txt'")
+        except Exception as e:
+            pass
+
+        return len(pruned_func_names)
