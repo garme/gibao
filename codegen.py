@@ -1837,7 +1837,7 @@ class CodeGen:
         
         report_lines = [
             "=================================================================",
-            "         CAFE OS (ESMERIX) - RELATÓRIO DE OTIMIZAÇÃO DCE",
+            "          CAFE OS (GUILIX) - RELATÓRIO DE OTIMIZAÇÃO DCE",
             "=================================================================",
             f"Total de funções originais analisadas : {len(original_func_names)}",
             f"Total de funções mantidas no binário  : {len(surviving_func_names)}",
