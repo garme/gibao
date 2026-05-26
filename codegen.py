@@ -39,7 +39,36 @@ class SymbolTable:
 
 
 class CodeGen:
-    def __init__(self):
+    def __init__(self, target="full", main_epilogue=None, enable_dce=None, stack_size=100):
+        """
+        target:
+          - full: comportamento histórico do compilador (programa completo)
+          - kernel: compila apenas o kernel, preservando handlers/syscalls
+          - overlay: compila aplicação de usuário; main() termina via syscall exit
+
+        main_epilogue:
+          - halt: main() emite INT HALT_INT
+          - exit: main() emite syscall exit
+          - none: main() não emite epílogo automático
+        """
+        self.target = (target or "full").lower()
+        if self.target in ("kernel+overlay", "kernel_overlay", "kernel-overlays"):
+            self.target = "kernel"
+        if self.target not in ("full", "kernel", "overlay"):
+            self.target = "full"
+
+        if main_epilogue is None:
+            main_epilogue = "exit" if self.target == "overlay" else "halt"
+        self.main_epilogue = main_epilogue
+
+        if enable_dce is None:
+            # full preserva a poda histórica do CAFE OS; overlay usa DCE simples;
+            # kernel não poda para não remover handlers/syscalls não chamados diretamente.
+            enable_dce = self.target in ("full", "overlay")
+        self.enable_dce = enable_dce
+        self.stack_size = int(stack_size or 100)
+        self.optimization_report = ""
+
         self.code = []
         self.data = set()
         self.constants = {}
@@ -75,6 +104,17 @@ class CodeGen:
         
         self.current_line = None
 
+    def const_to_int(self, value):
+        """Converte literal Const em inteiro de 16 bits quando possível."""
+        if isinstance(value, int):
+            return value
+        try:
+            return int(value)
+        except Exception:
+            if isinstance(value, str) and len(value) == 1:
+                return ord(value)
+            return 0
+
     def string_to_bytes(self, s_val):
         """Converte string literal em lista de inteiros (ASCII + 0)."""
         if s_val.startswith('"') and s_val.endswith('"'):
@@ -88,11 +128,17 @@ class CodeGen:
         try:
             self.emit('.code')
             
-            # --- INJEÇÃO DO CALL GRAPH AQUI ---
-            # Removemos a gordura da Árvore Sintática antes de gerar qualquer coisa!
-            mortas = self.prune_dead_functions(program)
-            print(f"Otimização AST: {mortas} funções não utilizadas foram removidas.")
-            # ----------------------------------
+            # --- Otimização de funções mortas por modo de compilação ---
+            mortas = 0
+            if self.enable_dce:
+                if self.target == "overlay":
+                    mortas = self.prune_dead_functions_plain(program, roots=["main"])
+                else:
+                    # Mantém o comportamento histórico para compilação full do SO/programa.
+                    mortas = self.prune_dead_functions(program)
+            self.optimization_report = f"Otimização AST ({self.target}): {mortas} funções não utilizadas foram removidas."
+            print(self.optimization_report)
+            # --------------------------------------------------------------
 
             # ---------------------------------------------------------
             # 1. SETUP INICIAL
@@ -328,7 +374,7 @@ class CodeGen:
                     name, size, kind = entry[0], entry[1], (entry[2] if len(entry)>2 else "RESD")
                     self.emit(f"{name}: {kind} {size}")
 
-            self.emit('.stack 100') 
+            self.emit(f'.stack {self.stack_size}') 
             return '\n'.join(self.code)
 
         except Exception as e:
@@ -733,8 +779,9 @@ class CodeGen:
             self.emit(f"MOV {label}") 
 
         elif isinstance(expr, Const):
-            label = self.get_const_label(expr.value)
-            self.emit(f'LDA {label}')
+            # Constantes literais simples podem entrar diretamente no AC.
+            # Isso reduz .data e evita LDA prog_const_N desnecessário.
+            self.emit(f'MOV {self.const_to_int(expr.value)}')
 
         elif isinstance(expr, TypeCast):
             self.generate_expr(expr.expr)
@@ -752,12 +799,12 @@ class CodeGen:
                 
                 # Bloco VERDADEIRO: Carrega 1 no AC e pula pro fim
                 self.emit(f'{lbl_true}:')
-                self.emit(f'LDA {self.get_const_label(1)}')
+                self.emit('MOV 1')
                 self.emit(f'JMP {lbl_end}')
                 
                 # Bloco FALSO: Carrega 0 no AC
                 self.emit(f'{lbl_false}:')
-                self.emit(f'LDA {self.get_const_label(0)}')
+                self.emit('MOV 0')
                 
                 self.emit(f'{lbl_end}:')
                 return  # Sai da função para não executar o resto da matemática binária
@@ -1508,7 +1555,7 @@ class CodeGen:
             # ~ self.emit("RET")
         
         if func.name == 'main':
-            self.emit("INT HALT_INT")
+            self.emit_main_epilogue()
         elif func.rettype is None and not self.has_explicit_return(func):
             # Funções void sem return explícito
             self.emit("SOP POP_OP")
@@ -1529,6 +1576,79 @@ class CodeGen:
         if not hasattr(self, "all_local_bss"): self.all_local_bss = []
         self.all_local_data.extend(self.local_data)
         self.all_local_bss.extend(self.local_bss)
+
+
+    def emit_main_epilogue(self):
+        """Emite o final automático de main() conforme o alvo de compilação."""
+        ep = (self.main_epilogue or "halt").lower()
+        if ep == "halt":
+            self.emit("INT HALT_INT")
+        elif ep == "exit":
+            # ABI de user space: syscall exit = 1.
+            # Empilha argumento dummy e ID da syscall, depois trap para o kernel.
+            self.emit("MOV 0")
+            self.emit("SOP PUSH_OP")
+            self.emit("MOV 1")
+            self.emit("SOP PUSH_OP")
+            self.emit("INT SYSCALL_INT")
+            # Defesa: se o kernel retornar indevidamente, cede a CPU continuamente.
+            loop = self.new_label("overlay_exit_loop")
+            self.emit(f"{loop}:")
+            self.emit("MOV 0")
+            self.emit("SOP PUSH_OP")
+            self.emit("MOV 9")
+            self.emit("SOP PUSH_OP")
+            self.emit("INT SYSCALL_INT")
+            self.emit(f"JMP {loop}")
+        elif ep == "none":
+            pass
+        else:
+            raise CodeGenError(f"Epílogo de main desconhecido: {self.main_epilogue}")
+
+    def prune_dead_functions_plain(self, program, roots=None):
+        """
+        DCE simples para overlays: mantém apenas funções alcançáveis a partir de main()
+        ou dos roots informados. Não injeta dependências de kernel.
+        """
+        roots = roots or ["main"]
+        original_func_names = [f.name for f in program.items if isinstance(f, Function)]
+        all_functions = {f.name: f for f in program.items if isinstance(f, Function)}
+
+        def get_refs(node):
+            refs = set()
+            if node is None or isinstance(node, (int, str, bool, float)):
+                return refs
+            if isinstance(node, list):
+                for x in node:
+                    refs.update(get_refs(x))
+                return refs
+            if isinstance(node, Var) and node.name in all_functions:
+                refs.add(node.name)
+            if isinstance(node, Asm):
+                for word in re.findall(r"[A-Za-z_]\w*", node.code):
+                    if word in all_functions:
+                        refs.add(word)
+            if hasattr(node, "__dict__"):
+                for k, v in vars(node).items():
+                    if k not in ("lineno", "colno", "end_lineno", "end_colno"):
+                        refs.update(get_refs(v))
+            return refs
+
+        deps_cache = {name: get_refs(func.body) for name, func in all_functions.items()}
+        reachable = set()
+        worklist = [r for r in roots if r in all_functions]
+        # Mantém rotinas naked explicitamente referenciadas por ASM/função ponteiro quando alcançadas.
+        while worklist:
+            curr = worklist.pop(0)
+            if curr in all_functions and curr not in reachable:
+                reachable.add(curr)
+                worklist.extend(list(deps_cache.get(curr, set())))
+
+        program.items = [
+            item for item in program.items
+            if not isinstance(item, Function) or item.name in reachable
+        ]
+        return len(set(original_func_names) - reachable)
 
     def load_external_library(self, func_name):
         filename = os.path.join(self.library_path, f"{func_name}.cariri")

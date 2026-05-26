@@ -458,6 +458,35 @@ def pass_optimize_increments(lines: List[str], log: List[str]):
         i += 1
     return out
 
+
+# ----------------------------------------------------
+# PASS X — Remover STA tmp; LDA tmp redundante
+# ----------------------------------------------------
+def pass_remove_store_load_same_tmp(lines: List[str], log: List[str]):
+    """Remove LDA imediatamente após STA no mesmo temporário/variável.
+
+    Após `STA x`, o AC continua contendo o mesmo valor armazenado em x.
+    Portanto, `LDA x` logo em seguida é redundante quando não há instrução
+    intermediária que altere AC, flags ou memória.
+    """
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if i + 1 < n:
+            a = lines[i].strip()
+            b = lines[i+1].strip()
+            ma = re.match(r'^STA\s+([A-Za-z_]\w*)$', a)
+            mb = re.match(r'^LDA\s+([A-Za-z_]\w*)$', b)
+            if ma and mb and ma.group(1) == mb.group(1):
+                log_append(log, f"[Peephole] Removido reload redundante: '{b}' após '{a}' (linha {i+2})")
+                out.append(lines[i])
+                i += 2
+                continue
+        out.append(lines[i])
+        i += 1
+    return out
+
 # ----------------------------------------------------
 # LISTA DE PASSES (ORDEM recomendada)
 # ----------------------------------------------------
@@ -467,6 +496,7 @@ PASSES: List[Callable] = [
     pass_remove_jmp_to_next_label,
     pass_remove_load_store_noop,
     pass_remove_redundant_load_after_store,
+    pass_remove_store_load_same_tmp,
     # ~ pass_remove_sop_pop_before_load,  #Comentada porque perde SP <- SP + 1
     pass_remove_dead_loads,
     pass_optimize_increments      # <-- NOVO

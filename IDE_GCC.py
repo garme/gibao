@@ -15,6 +15,7 @@ try:
     from codegen import CodeGen, CodeGenError
     from optimizer import optimize_with_log
     from formatter import ASTFormatter
+    from build_modes import compile_c_to_asm, build_kernel_with_overlays
 except ImportError as e:
     print(f"Erro ao importar módulos do compilador: {e}")
     pass
@@ -2455,7 +2456,10 @@ class CaririIDE:
                               ("💾 Salvar", self.save_c_file, None),
                               ("❌ Fechar Aba", self.close_current_tab, None),
                               ("|", None, None),
-                              ("▶ COMPILAR", self.compile_code, "#2ea043"),
+                              ("▶ Full", self.compile_code, "#2ea043"),
+                              ("🧩 Kernel", self.compile_kernel, "#0969da"),
+                              ("📦 Overlay", self.compile_overlay, "#8250df"),
+                              ("🚀 Kernel+Overlay", self.compile_kernel_with_overlays_dialog, "#bf8700"),
                               ("|", None, None),
                               ("🔍 Buscar", self.find_replace_dialog, None),
                               ("🪄 Formatar", self.format_current_editor, None),
@@ -3116,12 +3120,54 @@ class CaririIDE:
         tree.bind("<Double-1>", on_double_click)
 
     def compile_code(self):
+        return self.compile_code_mode("full")
+
+    def compile_kernel(self):
+        return self.compile_code_mode("kernel")
+
+    def compile_overlay(self):
+        return self.compile_code_mode("overlay")
+
+    def _show_compilation_result(self, result, raw_code, mode_label="Full"):
+        """Atualiza os painéis da IDE usando o resultado do build_modes.compile_c_to_asm."""
+        pre = result["preprocessor"]
+        code = result["preprocessed_code"]
+        tokens = result["tokens"]
+        ast = result["ast"]
+        semantic = result["semantic"]
+        gen = result["codegen"]
+        final_asm = result["final_asm"]
+
+        self.log(self.preproc_tab, pre.get_log() + "\n--- Output ---\n" + code)
+        self.log(self.tokens_tab, "\n".join(map(str, tokens)))
+        self.log(self.ast_tab, format_ast(ast))
+        self.log(self.semantic_tab, semantic.get_log())
+        self.update_outline(semantic, raw_code)
+        self.log(self.code_tab, result["asm_raw"])
+        self.log(self.optimizer_tab, "\n".join(result.get("optimizer_log", [])))
+
+        if getattr(gen, "optimization_report", ""):
+            self.log(self.msg_tab, gen.optimization_report)
+
+        self.c_to_asm_map = result.get("c_to_asm_map", {})
+        self.asm_to_c_map = result.get("asm_to_c_map", {})
+        self.asm_editor.set_text(final_asm)
+
+    def compile_code_mode(self, mode="full"):
         editor = self.get_current_editor()
-        if not editor: return
-        
+        if not editor:
+            return
+
+        mode = (mode or "full").lower()
+        mode_names = {
+            "full": "Full Compilation",
+            "kernel": "Kernel",
+            "overlay": "Overlay"
+        }
+
         self.clear_logs()
         self.asm_editor.delete_text()
-        self.msg_notebook.select(self.msg_tab.master) 
+        self.msg_notebook.select(self.msg_tab.master)
 
         raw_code = editor.get_text()
         if not raw_code.strip():
@@ -3129,88 +3175,95 @@ class CaririIDE:
             return
 
         try:
-            self.status_bar.config(text="Compilando...")
+            self.status_bar.config(text=f"Compilando modo {mode_names.get(mode, mode)}...")
             self.root.update_idletasks()
-            
-            start_time = time.time() 
-            
-            # --- FIX: Garante que o compilador rode na pasta física do arquivo atual ---
-            compile_dir = os.path.dirname(editor.filename) if editor.filename else editor.workspace_dir
-            if compile_dir:
-                os.chdir(compile_dir)
-                if hasattr(Preprocessor, 'LOCAL_INCLUDE_DIRS'):
-                    Preprocessor.LOCAL_INCLUDE_DIRS = [compile_dir, "./"]
+            start_time = time.time()
 
-            pre = Preprocessor()
-            code = pre.preprocess(raw_code)
-            self.log(self.preproc_tab, pre.get_log() + "\n--- Output ---\n" + code)
+            result = compile_c_to_asm(
+                raw_code,
+                filename=editor.filename,
+                mode=mode,
+                optimize=True,
+                required_entry="main"
+            )
+            self._show_compilation_result(result, raw_code, mode_names.get(mode, mode))
 
-            tokens = list(tokenize(code))
-            self.log(self.tokens_tab, "\n".join(map(str, tokens)))
-
-            parser = Parser(tokens)
-            ast = parser.parse_program()
-            self.log(self.ast_tab, format_ast(ast))
-
-            semantic = Semantic(ast)
-            semantic.analyze()
-            self.log(self.semantic_tab, semantic.get_log())
-            
-            self.update_outline(semantic, raw_code)
-
-            gen = CodeGen()
-            asm = gen.generate(ast)
-            self.log(self.code_tab, asm)
-
-            opt_asm, opt_log = optimize_with_log(asm.splitlines(True))
-            self.log(self.optimizer_tab, "\n".join(opt_log))
-            
-            # --- FIX: A variável agora se chama final_asm_raw ---
-            final_asm_raw = "".join(opt_asm)
-            
-            # =================================================================
-            # MOTOR DE SOURCE MAP (LIVE DISASSEMBLY)
-            # =================================================================
-            clean_asm_lines = []
-            self.c_to_asm_map = {} # Dicionário: Linha C -> [Linhas ASM]
-            self.asm_to_c_map = {} # Dicionário: Linha ASM -> Linha C
-            
-            for i, line in enumerate(final_asm_raw.split('\n')):
-                match = re.search(r';@ln:\s*(\d+)', line)
-                if match:
-                    c_line = int(match.group(1))
-                    
-                    # Remove o carimbo invisível do texto final
-                    clean_line = line.replace(match.group(0), '').rstrip()
-                    
-                    if c_line not in self.c_to_asm_map:
-                        self.c_to_asm_map[c_line] = []
-                        
-                    self.c_to_asm_map[c_line].append(i + 1)
-                    self.asm_to_c_map[i + 1] = c_line
-                    
-                    clean_asm_lines.append(clean_line)
-                else:
-                    clean_asm_lines.append(line)
-                    
-            final_asm = "\n".join(clean_asm_lines)
-            # =================================================================
-
-            self.asm_editor.set_text(final_asm)
-            
             end_time = time.time()
-            total_time_ms = (end_time - start_time) * 1000 
-            
-            self.log(self.msg_tab, f"✅ Sucesso! Geração de Assembly CARIRI concluída.", clear=True)
+            total_time_ms = (end_time - start_time) * 1000
+
+            epilogue_msg = ""
+            if mode == "overlay":
+                epilogue_msg = " | main() finaliza via syscall exit"
+            elif mode == "kernel":
+                epilogue_msg = " | handlers preservados sem DCE agressivo"
+
+            self.log(self.msg_tab, f"✅ Sucesso! Modo {mode_names.get(mode, mode)} concluído.{epilogue_msg}", clear=False)
             self.log(self.msg_tab, f"⏱️ Tempo total de Build: {total_time_ms:.2f} ms")
-            
+
             idx = editor.text_area.index("insert")
             line, col = idx.split('.')
-            self.status_bar.config(text=f"Pronto | Compilado em {total_time_ms:.0f}ms | Ln {line}, Col {int(col)+1} | Workspace CompSim | Ctrl+Space: Autocomplete")
+            self.status_bar.config(text=f"Pronto | {mode_names.get(mode, mode)} em {total_time_ms:.0f}ms | Ln {line}, Col {int(col)+1}")
 
         except Exception as e:
             self.log(self.msg_tab, f"❌ Erro: {str(e)}", clear=True)
             self.status_bar.config(text="Erro de Compilação")
+
+    def compile_kernel_with_overlays_dialog(self):
+        editor = self.get_current_editor()
+        if not editor:
+            return
+
+        if not editor.filename:
+            messagebox.showwarning(
+                "Kernel+Overlay",
+                "Salve o arquivo do kernel antes de gerar Kernel+Overlay. Isso é necessário para resolver #include locais."
+            )
+            return
+
+        overlay_files = filedialog.askopenfilenames(
+            title="Selecione os arquivos C de overlay",
+            filetypes=[("Arquivos C", "*.c"), ("Todos os arquivos", "*.*")]
+        )
+        if not overlay_files:
+            return
+
+        self.clear_logs()
+        self.asm_editor.delete_text()
+        self.msg_notebook.select(self.msg_tab.master)
+
+        try:
+            self.status_bar.config(text="Compilando Kernel+Overlay...")
+            self.root.update_idletasks()
+            start_time = time.time()
+
+            build = build_kernel_with_overlays(editor.filename, overlay_files)
+            kernel_result = build["kernel"]
+            self._show_compilation_result(kernel_result, editor.get_text(), "Kernel")
+
+            generated_inc = build.get("generated_sys_overlays_inc", "")
+            if generated_inc:
+                self.log(self.msg_tab, "🧩 kernel/sys_overlays.inc gerado automaticamente em memória:")
+                self.log(self.msg_tab, generated_inc)
+
+            # Logs específicos dos overlays
+            for block in build["overlays"]:
+                comp = block["compile"]
+                self.log(self.msg_tab, f"📦 Overlay: {block['path']}")
+                self.log(self.msg_tab, f"   label={block['label']} | palavras={len(block['words'])}")
+                if getattr(comp["codegen"], "optimization_report", ""):
+                    self.log(self.msg_tab, "   " + comp["codegen"].optimization_report)
+
+            self.asm_editor.set_text(build["final_asm"])
+
+            end_time = time.time()
+            total_time_ms = (end_time - start_time) * 1000
+            self.log(self.msg_tab, "✅ Sucesso! Kernel compilado com overlays injetados no .data.", clear=False)
+            self.log(self.msg_tab, f"⏱️ Tempo total de Build: {total_time_ms:.2f} ms")
+            self.status_bar.config(text=f"Pronto | Kernel+Overlay em {total_time_ms:.0f}ms | overlays={len(overlay_files)}")
+
+        except Exception as e:
+            self.log(self.msg_tab, f"❌ Erro Kernel+Overlay: {str(e)}", clear=True)
+            self.status_bar.config(text="Erro de Compilação Kernel+Overlay")
 
     def check_unsaved_changes(self):
         checked_files = set() # Memória de arquivos já analisados

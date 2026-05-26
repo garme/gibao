@@ -29,8 +29,9 @@ class Semantic:
         "pow":      { "pow": 2 }
     }
 
-    def __init__(self, ast):
+    def __init__(self, ast, required_entry="main"):
         self.ast = ast
+        self.required_entry = required_entry
         self.global_scope = {}
         self.functions = {}
         self.current_scope = None
@@ -200,8 +201,8 @@ class Semantic:
                     raise SemanticError(f"Função '{decl.name}' já foi declarada.", get_lineno(decl))
                 self.functions[decl.name] = decl
 
-        if "main" not in self.functions:
-            raise SemanticError("Todo programa deve conter a função 'main'.", get_lineno(program))
+        if self.required_entry and self.required_entry not in self.functions:
+            raise SemanticError(f"Todo programa deve conter a função '{self.required_entry}'.", get_lineno(program))
 
         # Corpos das Funções
         for decl in program.items:
