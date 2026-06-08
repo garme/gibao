@@ -1826,7 +1826,8 @@ class CodeGen:
             9: 'yield', 10: 'print_char', 11: 'read_char', 12: 'sleep',
             13: 'alarm', 14: 'pause', 15: 'signal', 16: 'sigreturn', 17: 'get_signal',
             20: 'write_pipe', 21: 'read_pipe', 25: 'shmget',
-            27: 'msg_send', 28: 'msg_recv', 29: 'thread_create', 30: 'thread_exit'
+            27: 'msg_send', 28: 'msg_recv', 29: 'thread_create',
+            30: 'thread_exit'
         }
 
         kernel_mappings = {

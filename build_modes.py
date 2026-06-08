@@ -64,6 +64,7 @@ SYSCALL_NAMES = {
 BASE_KERNEL_MODULES = [
     "kernel/sys_mem.c",
     "kernel/sys_wakeup.c",
+    "kernel/sys_proc.c",          # núcleo comum: create_process_ex() e release resources
     "kernel/sys_proc_exit.c",
     "kernel/sys_proc_kill.c",
     "kernel/sys_overlay.c",
@@ -91,7 +92,7 @@ SYSCALL_MODULES = {
     25: ["kernel/sys_shm.c"],
     27: ["kernel/sys_msg.c"],
     28: ["kernel/sys_msg.c"],
-    29: ["kernel/sys_thread.c", "kernel/sys_proc_spawn.c"],
+    29: ["kernel/sys_thread.c"],
     30: ["kernel/sys_thread.c", "kernel/sys_thread_exit.c"],
 }
 
