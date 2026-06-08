@@ -1826,13 +1826,14 @@ class CodeGen:
             9: 'yield', 10: 'print_char', 11: 'read_char', 12: 'sleep',
             13: 'alarm', 14: 'pause', 15: 'signal', 16: 'sigreturn', 17: 'get_signal',
             20: 'write_pipe', 21: 'read_pipe', 25: 'shmget',
-            27: 'msg_send', 28: 'msg_recv', 29: 'thread_create'
+            27: 'msg_send', 28: 'msg_recv', 29: 'thread_create', 30: 'thread_exit'
         }
 
         kernel_mappings = {
             'write_pipe': 'kernel_write_pipe', 'read_pipe': 'kernel_read_pipe',
             'shmget': 'kernel_shmget', 'msg_send': 'kernel_msg_send', 'msg_recv': 'kernel_msg_recv',
             'spawn': 'kernel_spawn', 'thread_create': 'kernel_thread_create',
+            'thread_exit': 'kernel_thread_exit',
             'wait': 'kernel_wait', 'sleep': 'kernel_sleep',
             'alarm': 'kernel_alarm', 'pause': 'kernel_pause', 'signal': 'kernel_signal',
             'sigreturn': 'kernel_sigreturn', 'get_signal': 'kernel_get_signal',

@@ -56,6 +56,7 @@ SYSCALL_NAMES = {
     27: "msg_send",
     28: "msg_recv",
     29: "thread_create",
+    30: "thread_exit",
 }
 
 # Cada syscall habilita seu módulo mínimo de kernel e sua linha de dispatch.
@@ -91,6 +92,7 @@ SYSCALL_MODULES = {
     27: ["kernel/sys_msg.c"],
     28: ["kernel/sys_msg.c"],
     29: ["kernel/sys_thread.c", "kernel/sys_proc_spawn.c"],
+    30: ["kernel/sys_thread.c", "kernel/sys_thread_exit.c"],
 }
 
 DISPATCH_SNIPPETS = {
@@ -117,6 +119,7 @@ DISPATCH_SNIPPETS = {
     27: "if (tmp_sys_id == 27) { isr_tmp_ac = kernel_msg_send(tmp_sys_arg, tmp_sys_arg2); curr_pcb->ac = isr_tmp_ac; }",
     28: "if (tmp_sys_id == 28) { isr_tmp_ac = kernel_msg_recv(); curr_pcb->ac = isr_tmp_ac; }",
     29: "if (tmp_sys_id == 29) { isr_tmp_ac = kernel_thread_create(tmp_sys_arg, tmp_sys_arg2); curr_pcb->ac = isr_tmp_ac; }",
+    30: "if (tmp_sys_id == 30) { isr_tmp_ac = kernel_thread_exit(); curr_pcb->ac = isr_tmp_ac; }",
 }
 
 def detect_syscalls_from_asm(asm: str) -> set[int]:
@@ -156,7 +159,7 @@ def detect_syscalls_from_source(path: str) -> set[int]:
         "signal(": 15, "sigreturn(": 16, "get_signal(": 17,
         "write_pipe(": 20, "read_pipe(": 21,
         "shmget(": 25, "msg_send(": 27, "msg_recv(": 28,
-        "thread_create(": 29,
+        "thread_create(": 29, "thread_exit(": 30,
     }
     found = set()
     for token, sid in mapping.items():
