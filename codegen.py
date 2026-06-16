@@ -779,9 +779,16 @@ class CodeGen:
             self.emit(f"MOV {label}") 
 
         elif isinstance(expr, Const):
-            # Constantes literais simples podem entrar diretamente no AC.
-            # Isso reduz .data e evita LDA prog_const_N desnecessário.
-            self.emit(f'MOV {self.const_to_int(expr.value)}')
+            # MOV possui campo imediato de 12 bits e os valores 4081..4088
+            # são reservados aos registradores especiais. Literais negativos
+            # ou maiores que 4080 precisam ser carregados da seção .data para
+            # preservar os 16 bits (por exemplo, palavras de E/S 0x2802).
+            value = self.const_to_int(expr.value)
+            if 0 <= value <= 4080:
+                self.emit(f'MOV {value}')
+            else:
+                label = self.get_const_label(value)
+                self.emit(f'LDA {label}')
 
         elif isinstance(expr, TypeCast):
             self.generate_expr(expr.expr)
@@ -1826,15 +1833,13 @@ class CodeGen:
             9: 'yield', 10: 'print_char', 11: 'read_char', 12: 'sleep',
             13: 'alarm', 14: 'pause', 15: 'signal', 16: 'sigreturn', 17: 'get_signal',
             20: 'write_pipe', 21: 'read_pipe', 25: 'shmget',
-            27: 'msg_send', 28: 'msg_recv', 29: 'thread_create',
-            30: 'thread_exit'
+            27: 'msg_send', 28: 'msg_recv', 29: 'thread_create'
         }
 
         kernel_mappings = {
             'write_pipe': 'kernel_write_pipe', 'read_pipe': 'kernel_read_pipe',
             'shmget': 'kernel_shmget', 'msg_send': 'kernel_msg_send', 'msg_recv': 'kernel_msg_recv',
             'spawn': 'kernel_spawn', 'thread_create': 'kernel_thread_create',
-            'thread_exit': 'kernel_thread_exit',
             'wait': 'kernel_wait', 'sleep': 'kernel_sleep',
             'alarm': 'kernel_alarm', 'pause': 'kernel_pause', 'signal': 'kernel_signal',
             'sigreturn': 'kernel_sigreturn', 'get_signal': 'kernel_get_signal',

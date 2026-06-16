@@ -15,7 +15,7 @@ try:
     from codegen import CodeGen, CodeGenError
     from optimizer import optimize_with_log
     from formatter import ASTFormatter
-    from build_modes import compile_c_to_asm, build_kernel_with_overlays
+    from build_modes import compile_c_to_asm, build_kernel_with_overlays, analyze_asm_segments, validate_segment_limits
 except ImportError as e:
     print(f"Erro ao importar módulos do compilador: {e}")
     pass
@@ -3186,7 +3186,28 @@ class CaririIDE:
                 optimize=True,
                 required_entry="main"
             )
+
+            usage = analyze_asm_segments(result["final_asm"])
+            result["segment_usage"] = usage
+            if mode == "kernel":
+                if not usage.get("code_ok") or not usage.get("data_ok"):
+                    self.log(
+                        self.msg_tab,
+                        "⚠️ Kernel isolado usa o fallback completo e excede o limite. "
+                        "Use Kernel+Overlay para gerar o kernel seletivo executável."
+                    )
+            else:
+                validate_segment_limits(usage, mode_names.get(mode, mode))
+
             self._show_compilation_result(result, raw_code, mode_names.get(mode, mode))
+            self.log(
+                self.msg_tab,
+                f"📏 Segmentos: instruções={usage['code_words']}/4096 "
+                f"(livres: {usage['code_free']}) | "
+                f"dados+BSS+pilha={usage['data_total_words']}/4096 "
+                f"(livres: {usage['data_free']})"
+            )
+            self.log(self.msg_tab, f"🧾 Linhas ASM: {len(result['final_asm'].splitlines())}")
 
             end_time = time.time()
             total_time_ms = (end_time - start_time) * 1000
@@ -3245,15 +3266,51 @@ class CaririIDE:
                 self.log(self.msg_tab, "🧩 kernel/sys_overlays.inc gerado automaticamente em memória:")
                 self.log(self.msg_tab, generated_inc)
 
+            syscall_names = build.get("syscall_names", [])
+            if syscall_names:
+                self.log(self.msg_tab, "⚙️ Syscalls selecionadas automaticamente: " + ", ".join(syscall_names))
+
+            network_roles = build.get("network_roles", [])
+            if build.get("network_enabled"):
+                role_text = " + ".join(network_roles) if network_roles else "baixo nível"
+                self.log(self.msg_tab, f"🌐 Suporte de rede incluído no kernel seletivo: {role_text}")
+                self.log(self.msg_tab, "   isolamento de registradores por contexto/PID: porta privada 63")
+
+            line_usage = build.get("line_usage", {})
+            if line_usage:
+                self.log(self.msg_tab,
+                    f"🧾 Linhas ASM: kernel={line_usage['kernel_asm_lines']} | "
+                    f"overlays={line_usage['overlay_asm_lines']} | "
+                    f"arquivo final={line_usage['final_asm_lines']}")
+
             # Logs específicos dos overlays
             for block in build["overlays"]:
                 comp = block["compile"]
                 self.log(self.msg_tab, f"📦 Overlay: {block['path']}")
-                self.log(self.msg_tab, f"   label={block['label']} | palavras={len(block['words'])}")
+                usage = block.get("segment_usage", {})
+                self.log(self.msg_tab, f"   label={block['label']} | imagem={len(block['words'])} palavras")
+                if usage:
+                    self.log(self.msg_tab,
+                        f"   segmentos do overlay: código={usage['code_words']}/4096 | "
+                        f"dados+pilha={usage['data_total_words']}/4096")
                 if getattr(comp["codegen"], "optimization_report", ""):
                     self.log(self.msg_tab, "   " + comp["codegen"].optimization_report)
 
             self.asm_editor.set_text(build["final_asm"])
+
+            usage = build.get("segment_usage", {})
+            if usage:
+                self.log(self.msg_tab, "📏 Uso dos segmentos arquiteturais:")
+                self.log(self.msg_tab,
+                    f"   instruções: {usage['code_words']}/4096 "
+                    f"(livres: {usage['code_free']})")
+                self.log(self.msg_tab,
+                    f"   dados+BSS+pilha+imagens de overlay: {usage['data_total_words']}/4096 "
+                    f"(livres: {usage['data_free']})")
+                if usage['code_free'] < 512:
+                    self.log(self.msg_tab, "⚠️ Margem de instruções inferior a 512 palavras.")
+                if usage['data_free'] < 512:
+                    self.log(self.msg_tab, "⚠️ Margem de dados inferior a 512 palavras.")
 
             end_time = time.time()
             total_time_ms = (end_time - start_time) * 1000
