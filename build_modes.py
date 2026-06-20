@@ -58,6 +58,7 @@ SYSCALL_NAMES = {
     29: "thread_create",
     30: "net_out",
     31: "net_in",
+    32: "thread_exit",
 }
 
 # Cada syscall habilita seu módulo mínimo de kernel e sua linha de dispatch.
@@ -65,9 +66,9 @@ SYSCALL_NAMES = {
 BASE_KERNEL_MODULES = [
     "kernel/sys_mem.c",
     "kernel/sys_wakeup.c",
+    "kernel/sys_proc_resources.c",
     "kernel/sys_proc_exit.c",
     "kernel/sys_proc_kill.c",
-    "kernel/sys_overlay.c",
 ]
 SYSCALL_MODULES = {
     1: [],
@@ -75,7 +76,7 @@ SYSCALL_MODULES = {
     3: [],
     4: ["kernel/sys_sem.c"],
     5: ["kernel/sys_sem.c"],
-    6: ["kernel/sys_proc_spawn.c"],
+    6: ["kernel/sys_proc.c", "kernel/sys_proc_spawn.c"],
     7: ["kernel/sys_mutex.c"],
     8: ["kernel/sys_mutex.c"],
     9: [],
@@ -92,9 +93,10 @@ SYSCALL_MODULES = {
     25: ["kernel/sys_shm.c"],
     27: ["kernel/sys_msg.c"],
     28: ["kernel/sys_msg.c"],
-    29: ["kernel/sys_thread.c", "kernel/sys_proc_spawn.c"],
+    29: ["kernel/sys_proc.c", "kernel/sys_thread.c"],
     30: ["kernel/sys_net.c"],
     31: ["kernel/sys_net.c"],
+    32: ["kernel/sys_thread_exit.c"],
 }
 
 DISPATCH_SNIPPETS = {
@@ -106,7 +108,7 @@ DISPATCH_SNIPPETS = {
     6: "if (tmp_sys_id == 6) { isr_tmp_ac = kernel_spawn(tmp_sys_arg, tmp_sys_arg2); curr_pcb->ac = isr_tmp_ac; }",
     7: "if (tmp_sys_id == 7) { isr_tmp_ac = kernel_mutex_trylock(); curr_pcb->ac = isr_tmp_ac; }",
     8: "if (tmp_sys_id == 8) { kernel_mutex_unlock(); }",
-    9: "if (tmp_sys_id == 9) { }",
+    9: "if (tmp_sys_id == 9) { kernel_need_resched = 1; }",
     10: "if (tmp_sys_id == 10) { kernel_print_char(tmp_sys_arg); }",
     11: "if (tmp_sys_id == 11) { isr_tmp_ac = kernel_read_char(); curr_pcb->ac = isr_tmp_ac; }",
     12: "if (tmp_sys_id == 12) { kernel_sleep(tmp_sys_arg); }",
@@ -123,6 +125,7 @@ DISPATCH_SNIPPETS = {
     29: "if (tmp_sys_id == 29) { isr_tmp_ac = kernel_thread_create(tmp_sys_arg, tmp_sys_arg2); curr_pcb->ac = isr_tmp_ac; }",
     30: "if (tmp_sys_id == 30) { isr_tmp_ac = kernel_net_out(tmp_sys_arg); curr_pcb->ac = isr_tmp_ac; }",
     31: "if (tmp_sys_id == 31) { isr_tmp_ac = kernel_net_in(tmp_sys_arg); curr_pcb->ac = isr_tmp_ac; }",
+    32: "if (tmp_sys_id == 32) { isr_tmp_ac = kernel_thread_exit(); curr_pcb->ac = isr_tmp_ac; }",
 }
 
 def detect_syscalls_from_asm(asm: str) -> set[int]:
@@ -162,7 +165,7 @@ def detect_syscalls_from_source(path: str) -> set[int]:
         "signal(": 15, "sigreturn(": 16, "get_signal(": 17,
         "write_pipe(": 20, "read_pipe(": 21,
         "shmget(": 25, "msg_send(": 27, "msg_recv(": 28,
-        "thread_create(": 29,
+        "thread_create(": 29, "thread_exit(": 32,
         "net_sys_out(": 30, "net_sys_in(": 31,
     }
     found = set()
@@ -178,35 +181,74 @@ def detect_syscalls_from_source(path: str) -> set[int]:
         found.add(12)
     if "usr_read_char.c" in txt or "usr_stdio.c" in txt:
         found.add(11)
-    if "usr_net.c" in txt or "net_" in txt:
+    if ("usr_net.c" in txt or "usr_net_core.c" in txt or
+            "usr_net_tcp.c" in txt or "usr_net_udp.c" in txt or
+            "net_" in txt):
         found |= {30, 31}
     return found
 
 def detect_network_roles(paths: Sequence[str]) -> List[str]:
-    """Classifica o uso de rede dos overlays para relatório da IDE."""
+    """Classifica protocolos e papéis de rede para o relatório da IDE."""
     roles = set()
-    client_tokens = (
-        "net_connect_ipv4(", "net_connect_start(", "net_wait_connected(",
-        "net_wait_connected_socket(",
+    tcp_client_tokens = (
+        "net_connect_ipv4(", "net_connect_start(",
+        "net_wait_connected(", "net_wait_connected_socket(",
     )
-    server_tokens = (
+    tcp_server_tokens = (
         "net_bind_ipv4(", "net_bind_start(", "net_listen_socket(",
         "net_listen_start(", "net_accept(", "net_accept_start(",
         "net_wait_accept(",
     )
+    udp_client_tokens = (
+        "net_udp_sendto_ipv4(",
+    )
+    udp_server_tokens = (
+        "net_udp_bind_ipv4(",
+    )
+
     for path in paths:
         try:
             txt = Path(path).read_text(encoding="utf-8")
         except Exception:
             continue
-        if any(token in txt for token in client_tokens):
-            roles.add("cliente")
-        if any(token in txt for token in server_tokens):
-            roles.add("servidor")
-        if "usr_net.c" in txt and not roles:
-            roles.add("baixo_nivel")
-    order = ["cliente", "servidor", "baixo_nivel"]
+
+        if any(token in txt for token in tcp_client_tokens):
+            roles.add("TCP cliente")
+        if any(token in txt for token in tcp_server_tokens):
+            roles.add("TCP servidor")
+        udp_is_server = any(token in txt for token in udp_server_tokens)
+        udp_is_client = any(token in txt for token in udp_client_tokens)
+        if udp_is_server:
+            roles.add("UDP servidor")
+        elif udp_is_client:
+            roles.add("UDP cliente")
+
+        if "usr_net_tcp.c" in txt and not any(r.startswith("TCP") for r in roles):
+            roles.add("TCP baixo nível")
+        if "usr_net_udp.c" in txt and not any(r.startswith("UDP") for r in roles):
+            roles.add("UDP baixo nível")
+        if "usr_net_core.c" in txt and not roles:
+            roles.add("rede baixo nível")
+        if "usr_net.c" in txt and not any(r.startswith("TCP") for r in roles):
+            roles.add("TCP compatibilidade")
+
+    order = [
+        "TCP cliente", "TCP servidor", "TCP baixo nível", "TCP compatibilidade",
+        "UDP cliente", "UDP servidor", "UDP baixo nível", "rede baixo nível",
+    ]
     return [role for role in order if role in roles]
+
+
+def detect_network_protocols(paths: Sequence[str]) -> List[str]:
+    roles = detect_network_roles(paths)
+    protocols = []
+    if any(role.startswith("TCP") for role in roles):
+        protocols.append("TCP")
+    if any(role.startswith("UDP") for role in roles):
+        protocols.append("UDP")
+    if not protocols and roles:
+        protocols.append("baixo nível")
+    return protocols
 
 
 def count_text_lines(text: str) -> int:
@@ -229,14 +271,20 @@ def generate_sys_config_inc(syscalls: Iterable[int]) -> str:
 
 
 def generate_sys_kernel_includes_inc(syscalls: Iterable[int]) -> str:
+    enabled = set(syscalls)
     modules: list[str] = []
     for m in BASE_KERNEL_MODULES:
         if m not in modules:
             modules.append(m)
-    for sid in sorted(set(syscalls)):
+    for sid in sorted(enabled):
         for m in SYSCALL_MODULES.get(sid, []):
             if m not in modules:
                 modules.append(m)
+    # Spawn/threads já incluem sys_proc.c; nesse caso o overlay reutiliza
+    # create_process_ex() para evitar duplicação de código.
+    overlay_module = "kernel/sys_overlay_shared.c" if enabled.intersection({6, 29, 32}) else "kernel/sys_overlay.c"
+    if overlay_module not in modules:
+        modules.append(overlay_module)
     lines = [
         "#ifndef SYS_KERNEL_INCLUDES_INC",
         "#define SYS_KERNEL_INCLUDES_INC",
@@ -418,6 +466,50 @@ def normalize_mode(mode: str) -> str:
     return m
 
 
+def find_duplicate_asm_labels(asm: str) -> List[str]:
+    """Retorna colisões perigosas de rótulos ASM.
+
+    Definições repetidas de uma constante imutável com a mesma diretiva e o
+    mesmo valor são toleradas, pois alguns módulos históricos repetem, por
+    exemplo, ``HALT_INT: DD 25``. Colisões entre código, funções, BSS ou
+    definições diferentes são rejeitadas.
+    """
+    definitions: Dict[str, List[str]] = {}
+    for raw in str(asm).splitlines():
+        line = raw.split(";", 1)[0].strip()
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
+        if match:
+            label = match.group(1)
+            body = re.sub(r"\s+", " ", match.group(2).strip()).upper()
+            definitions.setdefault(label, []).append(body)
+
+    dangerous: List[str] = []
+    immutable = re.compile(r"^(DD|DB|INITD|INITB)\b")
+    for label, bodies in definitions.items():
+        if len(bodies) <= 1:
+            continue
+        same_immutable_constant = (
+            len(set(bodies)) == 1 and
+            bool(bodies[0]) and
+            immutable.match(bodies[0]) is not None
+        )
+        if not same_immutable_constant:
+            dangerous.append(label)
+    return sorted(dangerous)
+
+
+def validate_unique_asm_labels(asm: str, context: str = "ASM") -> None:
+    duplicates = find_duplicate_asm_labels(asm)
+    if duplicates:
+        preview = ", ".join(duplicates[:12])
+        if len(duplicates) > 12:
+            preview += f", ... (+{len(duplicates) - 12})"
+        raise ValueError(
+            f"{context}: rótulos ASM duplicados: {preview}. "
+            "Renomeie variáveis locais que colidam com nomes de funções."
+        )
+
+
 def strip_source_map(asm: str) -> Tuple[str, Dict[int, List[int]], Dict[int, int]]:
     clean_asm_lines: List[str] = []
     c_to_asm: Dict[int, List[int]] = {}
@@ -483,6 +575,7 @@ def compile_c_to_asm(
             final_asm_raw = "".join(opt_asm)
 
         final_asm, c_to_asm, asm_to_c = strip_source_map(final_asm_raw)
+        validate_unique_asm_labels(final_asm, context=f"Compilação {mode}")
 
         return {
             "mode": mode,
@@ -809,6 +902,7 @@ def build_kernel_with_overlays(kernel_path: str, overlay_paths: Sequence[str]) -
         "kernel_segment_usage": kernel_usage,
         "segment_usage": final_usage,
         "network_roles": detect_network_roles(overlay_paths),
+        "network_protocols": detect_network_protocols(overlay_paths),
         "network_enabled": bool({30, 31} & set(syscall_ids)),
         "line_usage": {
             "kernel_asm_lines": count_text_lines(str(kernel["final_asm"])),

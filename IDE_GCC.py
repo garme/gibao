@@ -3271,9 +3271,13 @@ class CaririIDE:
                 self.log(self.msg_tab, "⚙️ Syscalls selecionadas automaticamente: " + ", ".join(syscall_names))
 
             network_roles = build.get("network_roles", [])
+            network_protocols = build.get("network_protocols", [])
             if build.get("network_enabled"):
                 role_text = " + ".join(network_roles) if network_roles else "baixo nível"
+                protocol_text = " + ".join(network_protocols) if network_protocols else "genérico"
                 self.log(self.msg_tab, f"🌐 Suporte de rede incluído no kernel seletivo: {role_text}")
+                self.log(self.msg_tab, f"   protocolos detectados: {protocol_text}")
+                self.log(self.msg_tab, "   userland seletivo: usr_net_core.c + TCP e/ou UDP")
                 self.log(self.msg_tab, "   isolamento de registradores por contexto/PID: porta privada 63")
 
             line_usage = build.get("line_usage", {})

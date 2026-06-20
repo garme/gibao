@@ -382,6 +382,115 @@ class AssemblerCariri:
 
         self.assembled_code = codigo_final
 
+
+    # =======================================================================
+    #  OVERLAY EXPORT
+    # =======================================================================
+    def _overlay_lengths(self):
+        """Retorna (text_len, data_len, bss_len) sem padding MPU de 4 KiB."""
+        text_len = 0
+        data_len = 0
+        bss_len = 0
+        in_data = False
+        var_ops = ["DD", "DB", "RESB", "RESD", "INITD", "INITB"]
+
+        for linha in self.codigo:
+            if isinstance(linha, str):
+                continue
+            if len(linha) == 1:
+                token = str(linha[0]).upper()
+                if token not in self.instrucoes and token not in var_ops and token != "ORG":
+                    continue
+            op_idx = self._detect_op_index(linha)
+            token_op = str(linha[op_idx]).upper() if len(linha) > op_idx else ""
+            if token_op in var_ops:
+                in_data = True
+                val = linha[-1]
+                inc = 1
+                if token_op in ["DB", "INITB"]:
+                    if isinstance(val, (list, ParseResults)):
+                        inc = 0
+                        for item in val:
+                            if isinstance(item, (list, ParseResults)) and len(item) >= 2 and item[0] == '"':
+                                inc += len(item[1])
+                            else:
+                                inc += 1
+                elif token_op in ["INITD", "DD"]:
+                    inc = len(val) if isinstance(val, (list, ParseResults)) else 1
+                elif token_op in ["RESB", "RESD"]:
+                    inc = int(val)
+                if token_op in ["RESB", "RESD"]:
+                    bss_len += inc
+                else:
+                    data_len += inc
+            elif token_op == "ORG":
+                inc = int(linha[op_idx + 1])
+                if in_data:
+                    data_len += inc
+                else:
+                    text_len += inc
+            elif token_op in self.instrucoes:
+                if in_data:
+                    data_len += 1
+                else:
+                    text_len += 1
+        return text_len, data_len, bss_len
+
+    def export_overlay_image(self, stack_size=None):
+        """Exporta imagem compacta para uso pelo modo Kernel+Overlays da IDE.
+
+        Retorna dicionário com text/data sem padding MPU. O bss é apenas tamanho.
+        """
+        if self.codigo is None or self.assembled_code is None:
+            raise RuntimeError("Monte o código antes de exportar overlay.")
+        if isinstance(self.assembled_code, str):
+            raise RuntimeError(self.assembled_code)
+        text_len, data_len, bss_len = self._overlay_lengths()
+        text_words = self.assembled_code[:text_len]
+        data_words = self.assembled_code[self.DS:self.DS + data_len] if data_len else []
+        entry_pc = 0
+        if isinstance(self.tabela_simbolos, dict) and "main" in self.tabela_simbolos:
+            entry_pc = (int(self.tabela_simbolos["main"]) - self.CS) & 0xFFF
+        return {
+            "magic": 0xCAFE,
+            "version": 1,
+            "entry_pc": entry_pc,
+            "text_size": len(text_words),
+            "data_size": len(data_words),
+            "bss_size": bss_len,
+            "stack_size": int(stack_size if stack_size is not None else (self.stack_size or 40)),
+            "text": text_words,
+            "data": data_words,
+        }
+
+    def export_overlay_initd(self, label, stack_size=None):
+        img = self.export_overlay_image(stack_size=stack_size)
+        def chunks(words, n=12):
+            for i in range(0, len(words), n):
+                yield words[i:i+n]
+        out = []
+        out.append(f"; --- overlay {label} ---")
+        out.append(f"{label}: INITD {img['magic']}, {img['version']}, {img['entry_pc']}, {img['text_size']}, {img['data_size']}, {img['bss_size']}, {img['stack_size']}")
+        out.append(f"{label}_text:")
+        if img['text']:
+            for ch in chunks(img['text']):
+                out.append("    INITD " + ", ".join("0x" + w for w in ch))
+        else:
+            out.append("    INITD 0")
+        out.append(f"{label}_data:")
+        if img['data']:
+            for ch in chunks(img['data']):
+                out.append("    INITD " + ", ".join("0x" + w for w in ch))
+        else:
+            out.append("    INITD 0")
+        if img['bss_size'] > 0:
+            out.append(f"{label}_bss:")
+            zeros = ["0000"] * img['bss_size']
+            for ch in chunks(zeros):
+                out.append("    INITD " + ", ".join("0x" + w for w in ch))
+        out.append(f"; --- end overlay {label} ---")
+        return "\n".join(out) + "\n"
+
 # =======================================================================
 # =======================================================================
     def get_variables_addresses(self):
