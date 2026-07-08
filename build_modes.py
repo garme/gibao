@@ -28,6 +28,8 @@ except Exception:  # mantém a IDE funcional mesmo sem assembler no PYTHONPATH
 
 VALID_MODES = {"full", "kernel", "overlay"}
 
+DEFAULT_DYNAMIC_COV_WINDOW_WORDS = 1024
+
 
 # ---------------------------------------------------------------------------
 # Otimização Kernel+Overlay: seleção automática de syscalls e módulos.
@@ -59,6 +61,9 @@ SYSCALL_NAMES = {
     30: "net_out",
     31: "net_in",
     32: "thread_exit",
+    33: "fs_out",
+    34: "fs_in",
+    35: "fs_exec",
 }
 
 # Cada syscall habilita seu módulo mínimo de kernel e sua linha de dispatch.
@@ -97,6 +102,9 @@ SYSCALL_MODULES = {
     30: ["kernel/sys_net.c"],
     31: ["kernel/sys_net.c"],
     32: ["kernel/sys_thread_exit.c"],
+    33: ["kernel/sys_fs.c"],
+    34: ["kernel/sys_fs.c"],
+    35: ["kernel/sys_fs.c"],
 }
 
 DISPATCH_SNIPPETS = {
@@ -126,6 +134,9 @@ DISPATCH_SNIPPETS = {
     30: "if (tmp_sys_id == 30) { isr_tmp_ac = kernel_net_out(tmp_sys_arg); curr_pcb->ac = isr_tmp_ac; }",
     31: "if (tmp_sys_id == 31) { isr_tmp_ac = kernel_net_in(tmp_sys_arg); curr_pcb->ac = isr_tmp_ac; }",
     32: "if (tmp_sys_id == 32) { isr_tmp_ac = kernel_thread_exit(); curr_pcb->ac = isr_tmp_ac; }",
+    33: "if (tmp_sys_id == 33) { isr_tmp_ac = kernel_fs_out(tmp_sys_arg); curr_pcb->ac = isr_tmp_ac; }",
+    34: "if (tmp_sys_id == 34) { isr_tmp_ac = kernel_fs_in(tmp_sys_arg); curr_pcb->ac = isr_tmp_ac; }",
+    35: "if (tmp_sys_id == 35) { isr_tmp_ac = kernel_fs_exec(tmp_sys_arg); curr_pcb->ac = isr_tmp_ac; }",
 }
 
 def detect_syscalls_from_asm(asm: str) -> set[int]:
@@ -167,6 +178,7 @@ def detect_syscalls_from_source(path: str) -> set[int]:
         "shmget(": 25, "msg_send(": 27, "msg_recv(": 28,
         "thread_create(": 29, "thread_exit(": 32,
         "net_sys_out(": 30, "net_sys_in(": 31,
+        "fs_sys_out(": 33, "fs_sys_in(": 34, "fs_sys_exec(": 35, "fs_exec(": 35,
     }
     found = set()
     for token, sid in mapping.items():
@@ -185,6 +197,8 @@ def detect_syscalls_from_source(path: str) -> set[int]:
             "usr_net_tcp.c" in txt or "usr_net_udp.c" in txt or
             "net_" in txt):
         found |= {30, 31}
+    if ("usr_fs.c" in txt or "fs_" in txt):
+        found |= {33, 34}
     return found
 
 def detect_network_roles(paths: Sequence[str]) -> List[str]:
@@ -254,6 +268,39 @@ def detect_network_protocols(paths: Sequence[str]) -> List[str]:
 def count_text_lines(text: str) -> int:
     """Número total de linhas textuais do ASM/arquivo gerado."""
     return len(str(text).splitlines())
+
+
+
+def detect_fs_operations(paths: Sequence[str]) -> List[str]:
+    """Classifica operações de FS usadas por overlays para o relatório da IDE."""
+    ops = set()
+    op_tokens = {
+        "mount": ("fs_mount(",),
+        "mkdir": ("fs_mkdir(",),
+        "open_read": ("fs_open_read(",),
+        "open_write": ("fs_open_write(",),
+        "read": ("fs_read_byte(", "fs_read_all(", "fs_print_file("),
+        "write": ("fs_write_byte(", "fs_write_text("),
+        "list": ("fs_list(",),
+        "exists": ("fs_exists(",),
+        "delete": ("fs_delete(",),
+        "close": ("fs_close(",),
+    }
+    for path in paths:
+        try:
+            txt = Path(path).read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if "usr_fs.c" in txt:
+            ops.add("API FS")
+        for name, tokens in op_tokens.items():
+            if any(token in txt for token in tokens):
+                ops.add(name)
+    return sorted(ops)
+
+def is_fs_enabled(syscalls: Iterable[int]) -> bool:
+    """Retorna True quando o kernel seletivo precisa incluir o periférico de FS."""
+    return bool({33, 34, 35} & set(syscalls))
 
 
 def generate_sys_config_inc(syscalls: Iterable[int]) -> str:
@@ -821,6 +868,115 @@ def compile_overlay_file_to_initd(path: str, overlay_index: int) -> Dict[str, ob
     }
 
 
+
+def overlay_asm_to_cov_words(asm: str) -> Dict[str, object]:
+    """
+    Converte ASM de overlay para imagem .COV compacta v2.
+
+    Formato:
+      [0] magic      = 0xCAFE
+      [1] version    = 2
+      [2] entry_pc
+      [3] ds_delta
+      [4] code_size
+      [5] data_size
+      [6...] code_words + data_words
+    """
+    image = assemble_overlay_image(asm)
+    words = [
+        0xCAFE, 2, image["entry_pc"], image["ds_delta"],
+        image["code_size"], image["data_size"],
+    ] + list(image["code_words"]) + list(image["data_words"])
+
+    return {
+        "words": words,
+        "image": image,
+        "total_words": len(words),
+        "code_size": image["code_size"],
+        "data_size": image["data_size"],
+    }
+
+
+def write_cov_file(path: str, words: Sequence[int]) -> str:
+    """Grava uma lista de palavras de 16 bits em arquivo .COV little-endian."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    data = bytearray()
+    for w in words:
+        value = int(w) & 0xFFFF
+        data.append(value & 0xFF)
+        data.append((value >> 8) & 0xFF)
+
+    p.write_bytes(bytes(data))
+    return str(p)
+
+
+def compile_c_to_cov_words(
+    raw_code: str,
+    filename: Optional[str] = None,
+    optimize: bool = True,
+    file_system: Optional[Dict[str, str]] = None,
+    window_words: int = DEFAULT_DYNAMIC_COV_WINDOW_WORDS,
+) -> Dict[str, object]:
+    """Compila C em modo overlay e retorna a imagem .COV compacta v2."""
+    result = compile_c_to_asm(
+        raw_code,
+        filename=filename,
+        mode="overlay",
+        optimize=optimize,
+        required_entry="main",
+        file_system=file_system,
+    )
+
+    usage = analyze_asm_segments(str(result["final_asm"]))
+    validate_segment_limits(usage, f"Overlay .COV {Path(filename).name if filename else ''}".strip())
+
+    cov = overlay_asm_to_cov_words(str(result["final_asm"]))
+    cov["compile"] = result
+    cov["segment_usage"] = usage
+    cov["window_words"] = int(window_words)
+    cov["fits_window"] = int(cov["total_words"] <= int(window_words))
+    cov["window_free"] = int(window_words) - int(cov["total_words"])
+    return cov
+
+
+def compile_file_to_cov_words(
+    path: str,
+    optimize: bool = True,
+    file_system: Optional[Dict[str, str]] = None,
+    window_words: int = DEFAULT_DYNAMIC_COV_WINDOW_WORDS,
+) -> Dict[str, object]:
+    """Compila um arquivo C para imagem .COV compacta v2."""
+    p = Path(path)
+    return compile_c_to_cov_words(
+        p.read_text(encoding="utf-8"),
+        filename=str(p),
+        optimize=optimize,
+        file_system=file_system,
+        window_words=window_words,
+    )
+
+
+def compile_file_to_cov_file(
+    source_path: str,
+    output_path: str,
+    optimize: bool = True,
+    file_system: Optional[Dict[str, str]] = None,
+    window_words: int = DEFAULT_DYNAMIC_COV_WINDOW_WORDS,
+) -> Dict[str, object]:
+    """Compila um arquivo C para .COV e grava o binário."""
+    cov = compile_file_to_cov_words(
+        source_path,
+        optimize=optimize,
+        file_system=file_system,
+        window_words=window_words,
+    )
+    write_cov_file(output_path, cov["words"])
+    cov["output_path"] = str(output_path)
+    return cov
+
+
 def inject_overlay_blocks(kernel_asm: str, overlay_blocks: Sequence[Dict[str, object]]) -> str:
     """Injeta tabela e imagens de overlay na seção .data do kernel."""
     if not overlay_blocks:
@@ -904,6 +1060,9 @@ def build_kernel_with_overlays(kernel_path: str, overlay_paths: Sequence[str]) -
         "network_roles": detect_network_roles(overlay_paths),
         "network_protocols": detect_network_protocols(overlay_paths),
         "network_enabled": bool({30, 31} & set(syscall_ids)),
+        "fs_operations": detect_fs_operations(overlay_paths),
+        "fs_enabled": is_fs_enabled(syscall_ids),
+        "storage_enabled": is_fs_enabled(syscall_ids),
         "line_usage": {
             "kernel_asm_lines": count_text_lines(str(kernel["final_asm"])),
             "final_asm_lines": count_text_lines(final_asm),

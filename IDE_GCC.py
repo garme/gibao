@@ -15,7 +15,7 @@ try:
     from codegen import CodeGen, CodeGenError
     from optimizer import optimize_with_log
     from formatter import ASTFormatter
-    from build_modes import compile_c_to_asm, build_kernel_with_overlays, analyze_asm_segments, validate_segment_limits
+    from build_modes import compile_c_to_asm, build_kernel_with_overlays, analyze_asm_segments, validate_segment_limits, compile_c_to_cov_words, write_cov_file, DEFAULT_DYNAMIC_COV_WINDOW_WORDS
 except ImportError as e:
     print(f"Erro ao importar módulos do compilador: {e}")
     pass
@@ -2459,6 +2459,7 @@ class CaririIDE:
                               ("▶ Full", self.compile_code, "#2ea043"),
                               ("🧩 Kernel", self.compile_kernel, "#0969da"),
                               ("📦 Overlay", self.compile_overlay, "#8250df"),
+                              ("💾 .COV", self.generate_cov_file, "#6f42c1"),
                               ("🚀 Kernel+Overlay", self.compile_kernel_with_overlays_dialog, "#bf8700"),
                               ("|", None, None),
                               ("🔍 Buscar", self.find_replace_dialog, None),
@@ -2484,6 +2485,7 @@ class CaririIDE:
         file_menu.add_checkbutton(label="Auto-Salvar", variable=self.auto_save_var)
         file_menu.add_separator()
         file_menu.add_command(label="Salvar Assembly (CARIRI)", command=self.save_asm_file)
+        file_menu.add_command(label="Gerar .COV do Overlay", command=self.generate_cov_file)
         file_menu.add_separator()
         file_menu.add_command(label="Sair", command=self.on_close, accelerator="Ctrl+Q")
         menubar.add_cascade(label="Arquivo", menu=file_menu)
@@ -3128,6 +3130,112 @@ class CaririIDE:
     def compile_overlay(self):
         return self.compile_code_mode("overlay")
 
+    def generate_cov_file(self):
+        """Gera arquivo .COV binário a partir da aba C atual, sem remover os fluxos existentes."""
+        editor = self.get_current_editor()
+        if not editor:
+            return
+
+        raw_code = editor.get_text()
+        if not raw_code.strip():
+            self.log(self.msg_tab, "Código fonte vazio.")
+            return
+
+        source_name = editor.filename or "programa.c"
+        base_name = os.path.splitext(os.path.basename(source_name))[0] or "PROGRAMA"
+        default_name = base_name.upper() + ".COV"
+
+        output_path = filedialog.asksaveasfilename(
+            title="Gerar arquivo .COV",
+            defaultextension=".COV",
+            initialfile=default_name,
+            filetypes=[
+                ("Overlay COV", "*.COV"),
+                ("Overlay cov", "*.cov"),
+                ("Todos os arquivos", "*.*"),
+            ],
+        )
+
+        if not output_path:
+            return
+
+        self.clear_logs()
+        self.asm_editor.delete_text()
+        self.msg_notebook.select(self.msg_tab.master)
+
+        try:
+            self.status_bar.config(text="Gerando .COV...")
+            self.root.update_idletasks()
+            start_time = time.time()
+
+            cov = compile_c_to_cov_words(
+                raw_code,
+                filename=editor.filename,
+                optimize=True,
+                window_words=DEFAULT_DYNAMIC_COV_WINDOW_WORDS,
+            )
+
+            total = int(cov["total_words"])
+            limit = int(cov["window_words"])
+
+            if total > limit:
+                continuar = messagebox.askyesno(
+                    "COV acima da janela dinâmica",
+                    "O .COV gerado possui "
+                    + str(total)
+                    + " palavras, mas a janela dinâmica configurada possui "
+                    + str(limit)
+                    + " palavras.\n\n"
+                    + "Esse arquivo não será executado no shell atual sem aumentar "
+                    + "FS_DYN_SLOT_WORDS/fs_dyn_overlay_pool.\n\n"
+                    + "Deseja salvar mesmo assim?"
+                )
+                if not continuar:
+                    self.log(
+                        self.msg_tab,
+                        f"⚠️ .COV não salvo: {total}/{limit} palavras excede a janela dinâmica."
+                    )
+                    self.status_bar.config(text="Geração .COV cancelada")
+                    return
+
+            write_cov_file(output_path, cov["words"])
+
+            self._show_compilation_result(cov["compile"], raw_code, "Overlay .COV")
+
+            usage = cov.get("segment_usage", {})
+            if usage:
+                self.log(
+                    self.msg_tab,
+                    f"📏 Segmentos: instruções={usage['code_words']}/4096 "
+                    f"(livres: {usage['code_free']}) | "
+                    f"dados+BSS+pilha={usage['data_total_words']}/4096 "
+                    f"(livres: {usage['data_free']})"
+                )
+
+            self.log(
+                self.msg_tab,
+                f"💾 .COV salvo: {output_path}"
+            )
+            self.log(
+                self.msg_tab,
+                f"📦 Imagem COV: total={total}/{limit} palavras | "
+                f"code={cov['code_size']} | data={cov['data_size']} | "
+                f"livres={cov['window_free']}"
+            )
+
+            if total <= limit:
+                self.log(self.msg_tab, "✅ .COV compatível com a janela dinâmica atual.")
+            else:
+                self.log(self.msg_tab, "⚠️ .COV salvo, mas excede a janela dinâmica atual.")
+
+            elapsed = (time.time() - start_time) * 1000
+            self.status_bar.config(text=f".COV gerado em {elapsed:.0f}ms")
+
+        except Exception as e:
+            self.log(self.msg_tab, f"❌ Erro ao gerar .COV: {str(e)}", clear=True)
+            self.status_bar.config(text="Erro ao gerar .COV")
+
+
     def _show_compilation_result(self, result, raw_code, mode_label="Full"):
         """Atualiza os painéis da IDE usando o resultado do build_modes.compile_c_to_asm."""
         pre = result["preprocessor"]
@@ -3279,6 +3387,13 @@ class CaririIDE:
                 self.log(self.msg_tab, f"   protocolos detectados: {protocol_text}")
                 self.log(self.msg_tab, "   userland seletivo: usr_net_core.c + TCP e/ou UDP")
                 self.log(self.msg_tab, "   isolamento de registradores por contexto/PID: porta privada 63")
+
+            if build.get("fs_enabled"):
+                fs_ops = build.get("fs_operations", [])
+                fs_text = ", ".join(fs_ops) if fs_ops else "baixo nível"
+                self.log(self.msg_tab, f"💾 Suporte de FS/disco incluído no kernel seletivo: {fs_text}")
+                self.log(self.msg_tab, "   syscalls detectadas: fs_out + fs_in")
+                self.log(self.msg_tab, "   periférico virtual: portas 64..79 com contexto/PID na porta 79")
 
             line_usage = build.get("line_usage", {})
             if line_usage:
