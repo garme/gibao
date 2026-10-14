@@ -173,6 +173,18 @@ def pass_remove_dead_loads(lines: List[str], log: List[str], window=4):
             for j in range(i+1, min(n, i+1+window)):
                 ls = lines[j].strip()
 
+                # BARREIRA DE FLUXO DE CONTROLE:
+                # dead-load é uma análise local e só é segura dentro do mesmo
+                # bloco básico. Não atravesse labels, desvios, CALL ou RET.
+                # Nesses casos preservamos conservadoramente o LDA.
+                if (
+                    is_label_line(ls)
+                    or re.match(r'^(JMP|JZ|JN|CALL)\b', ls)
+                    or ls == "RET"
+                ):
+                    used = True
+                    break
+
                 # USO do AC — instruções que realmente usam o valor carregado
                 if (
                     re.match(r'^(ADD|SUB|NAND|SHIFT|STA|STI|JZ|JN)\b', ls)

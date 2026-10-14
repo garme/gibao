@@ -104,6 +104,35 @@ class CodeGen:
         
         self.current_line = None
 
+        # ---------------------------------------------------------
+        # Temporários reentrantes por profundidade de expressão.
+        #
+        # O CodeGen histórico reutilizava nomes fixos como tmp_left e
+        # tmp_right. Uma expressão aninhada podia sobrescrever os
+        # temporários da expressão externa. Ex.:
+        #     enemy_y + (g_i + g_i)
+        #
+        # _temp_depth == -1 : fora de expressão/condição/lvalue
+        # _temp_depth ==  0 : expressão de nível externo (nomes antigos)
+        # _temp_depth >=  1 : usa sufixo _N (tmp_left_1, ...).
+        # ---------------------------------------------------------
+        self._temp_depth = -1
+        self._depth_temp_bases = (
+            'tmp_left_cond', 'tmp_right_cond',
+            'tmp_left_mul', 'tmp_right_mul',
+            'tmp_dividend', 'tmp_divisor', 'tmp_div_sign',
+            'tmp_res_div', 'tmp_res_mul', 'tmp_arr_base',
+            'tmp_ptr_src', 'tmp_ptr_fn', 'tmp_val_pop',
+            'tmp_old_val', 'tmp_not_a', 'tmp_not_b',
+            'tmp_a_mul', 'tmp_step', 'tmp_and',
+            'tmp_t1', 'tmp_t2', 'tmp_t3', 'tmp_rem',
+            'tmp_lhs', 'tmp_dst', 'tmp_src',
+            'tmp_left', 'tmp_right', 'tmp_ptr', 'tmp_val',
+        )
+        self._depth_temp_re = re.compile(
+            r'\b(' + '|'.join(map(re.escape, sorted(self._depth_temp_bases, key=len, reverse=True))) + r')\b'
+        )
+
     def const_to_int(self, value):
         """Converte literal Const em inteiro de 16 bits quando possível."""
         if isinstance(value, int):
@@ -366,7 +395,8 @@ class CodeGen:
 
             self.emit('PUSH_OP: DD 0')
             self.emit('POP_OP: DD 1')
-            self.emit('HALT_INT: DD 25')
+            if 'HALT_INT' not in already_data:
+                self.emit('HALT_INT: DD 25')
 
             if has_bss:
                 self.emit("\n.bss")
@@ -381,7 +411,29 @@ class CodeGen:
             if isinstance(e, CodeGenError): raise
             raise CodeGenError(str(e))
 
+    def _rewrite_depth_temps(self, instruction):
+        """Aplica nomes de temporários reentrantes na profundidade atual.
+
+        No nível 0 os nomes históricos são preservados para manter o ASM
+        simples e compatível. Em níveis aninhados, cada temporário interno
+        recebe um sufixo com a profundidade da expressão.
+        """
+        depth = self._temp_depth
+        if depth <= 0 or not isinstance(instruction, str):
+            return instruction
+        return self._depth_temp_re.sub(
+            lambda m: f"{m.group(1)}_{depth}",
+            instruction
+        )
+
+    def _enter_temp_scope(self):
+        self._temp_depth += 1
+
+    def _leave_temp_scope(self):
+        self._temp_depth -= 1
+
     def emit(self, instruction):
+        instruction = self._rewrite_depth_temps(instruction)
         # Ignora linhas vazias ou labels (ex: "L1:") para não sujar o mapa
         if self.current_line and not instruction.strip().endswith(':'):
             # Anexa o Source Map invisível no final da instrução
@@ -686,6 +738,14 @@ class CodeGen:
                 if ln.strip(): self.emit(ln)
 
     def gen_condition(self, cond, label_true, label_false):
+        """Wrapper reentrante: cada condição aninhada ganha temporários próprios."""
+        self._enter_temp_scope()
+        try:
+            return self._gen_condition_impl(cond, label_true, label_false)
+        finally:
+            self._leave_temp_scope()
+
+    def _gen_condition_impl(self, cond, label_true, label_false):
         # 1. Curto-circuito para AND (&&)
         if isinstance(cond, BinaryOp) and cond.op == '&&':
             lbl_next = self.new_label("and_next")
@@ -764,6 +824,18 @@ class CodeGen:
         return f'{base}_{self.label_counter}'
 
     def generate_expr(self, expr):
+        """Gera uma expressão usando temporários separados por profundidade.
+
+        A API pública permanece idêntica; portanto parser, IDE e build_modes
+        não precisam ser alterados.
+        """
+        self._enter_temp_scope()
+        try:
+            return self._generate_expr_impl(expr)
+        finally:
+            self._leave_temp_scope()
+
+    def _generate_expr_impl(self, expr):
         if hasattr(expr, 'lineno') and expr.lineno:
             self.current_line = expr.lineno
             
@@ -1715,6 +1787,14 @@ class CodeGen:
         raise CodeGenError(f"sizeof não suportado para tipo {t}")
 
     def gen_lvalue(self, expr):
+        """Gera endereço de lvalue com temporários reentrantes."""
+        self._enter_temp_scope()
+        try:
+            return self._gen_lvalue_impl(expr)
+        finally:
+            self._leave_temp_scope()
+
+    def _gen_lvalue_impl(self, expr):
         if isinstance(expr, Var):
             self.emit(f"MOV {self.symbol_table.resolve(expr.name)}")
         elif isinstance(expr, ArrayAccess):
@@ -1735,6 +1815,14 @@ class CodeGen:
             raise CodeGenError("Expressão não é lvalue.")
 
     def gen_array_element_address(self, expr):
+        """Calcula endereço de array sem colidir temporários de índices aninhados."""
+        self._enter_temp_scope()
+        try:
+            return self._gen_array_element_address_impl(expr)
+        finally:
+            self._leave_temp_scope()
+
+    def _gen_array_element_address_impl(self, expr):
         arr_t = expr.array.vartype
         if arr_t is None: raise CodeGenError("Array sem tipo.")
         if isinstance(arr_t, ArrayType): base_type = arr_t.base

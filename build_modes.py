@@ -10,6 +10,7 @@ Modos suportados:
 from __future__ import annotations
 
 import os
+import sys
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -28,7 +29,7 @@ except Exception:  # mantém a IDE funcional mesmo sem assembler no PYTHONPATH
 
 VALID_MODES = {"full", "kernel", "overlay"}
 
-DEFAULT_DYNAMIC_COV_WINDOW_WORDS = 1024
+DEFAULT_DYNAMIC_COV_WINDOW_WORDS = 1536
 
 
 # ---------------------------------------------------------------------------
@@ -575,15 +576,51 @@ def strip_source_map(asm: str) -> Tuple[str, Dict[int, List[int]], Dict[int, int
     return "\n".join(clean_asm_lines), c_to_asm, asm_to_c
 
 
-def _set_include_dirs(filename: Optional[str]) -> Optional[str]:
-    compile_dir = os.path.dirname(os.path.abspath(filename)) if filename else os.getcwd()
-    if compile_dir:
-        os.chdir(compile_dir)
-        if hasattr(Preprocessor, "LOCAL_INCLUDE_DIRS"):
-            # Ordem importante: pasta do fonte primeiro, depois diretório corrente.
-            Preprocessor.LOCAL_INCLUDE_DIRS = [compile_dir, "./"]
-    return compile_dir
+# ~ def _set_include_dirs(filename: Optional[str]) -> Optional[str]:
+    # ~ # Calcula os caminhos antes de alterar o diretório corrente.
+    # ~ ide_dir = os.path.dirname(os.path.abspath(__file__))
+    # ~ stdlib_dir = os.path.join(ide_dir, "stdlib")
+    # ~ compile_dir = (
+        # ~ os.path.dirname(os.path.abspath(filename))
+        # ~ if filename
+        # ~ else os.getcwd()
+    # ~ )
 
+    # ~ if compile_dir:
+        # ~ os.chdir(compile_dir)
+
+        # ~ if hasattr(Preprocessor, "LOCAL_INCLUDE_DIRS"):
+            # ~ Preprocessor.LOCAL_INCLUDE_DIRS = [
+                # ~ compile_dir,
+                # ~ stdlib_dir,
+                # ~ "./",
+            # ~ ]
+
+    # ~ return compile_dir
+
+def _set_include_dirs(filename: Optional[str]) -> Optional[str]:
+    # No executável, procura recursos ao lado da IDE.
+    # Nos fontes, procura ao lado de build_modes.py.
+    if getattr(sys, "frozen", False):
+        ide_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        ide_dir = os.path.dirname(os.path.abspath(__file__))
+
+    stdlib_dir = os.path.join(ide_dir, "stdlib")
+    compile_dir = (
+        os.path.dirname(os.path.abspath(filename))
+        if filename
+        else os.getcwd()
+    )
+
+    os.chdir(compile_dir)
+
+    Preprocessor.LOCAL_INCLUDE_DIRS = [
+        compile_dir,
+        stdlib_dir,
+    ]
+
+    return compile_dir
 
 def compile_c_to_asm(
     raw_code: str,

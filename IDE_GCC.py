@@ -5,6 +5,7 @@ import os
 import time
 import webbrowser
 import json
+import sys
 
 # Importações do seu compilador GIBÃO
 try:
@@ -686,11 +687,30 @@ class CodeEditor(ttk.Frame):
         if self.language != 'c': return
         self.text_area.tag_remove("linter_error", "1.0", "end")
         
-        if hasattr(self, 'workspace_dir') and self.workspace_dir:
-            try: os.chdir(self.workspace_dir)
-            except: pass
-            if hasattr(Preprocessor, 'LOCAL_INCLUDE_DIRS'):
-                Preprocessor.LOCAL_INCLUDE_DIRS = [self.workspace_dir, "./"]
+        # Localiza a pasta da IDE tanto nos fontes quanto no executável.
+        if getattr(sys, "frozen", False):
+            ide_dir = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            ide_dir = os.path.dirname(os.path.abspath(__file__))
+
+        stdlib_dir = os.path.join(ide_dir, "stdlib")
+
+        source_dir = (
+            os.path.abspath(self.workspace_dir)
+            if getattr(self, "workspace_dir", None)
+            else os.getcwd()
+        )
+
+        try:
+            os.chdir(source_dir)
+        except OSError:
+            pass
+
+        if hasattr(Preprocessor, "LOCAL_INCLUDE_DIRS"):
+            Preprocessor.LOCAL_INCLUDE_DIRS = [
+                source_dir,
+                stdlib_dir,
+            ]
         
         code = self.get_text()
         if not code.strip(): return

@@ -1,0 +1,15 @@
+{
+    "theme_dark": false,
+    "auto_save": false,
+    "panels": {
+        "explorer": true,
+        "outline": true,
+        "asm": true,
+        "logs": true
+    },
+    "split_active": false,
+    "active_tab_1": 0,
+    "active_tab_2": 0,
+    "editors_1": [],
+    "editors_2": []
+}
