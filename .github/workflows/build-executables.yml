@@ -1,0 +1,110 @@
+name: Gerar executaveis Linux e Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+          - os: windows-latest
+            platform: windows-x86_64
+
+    steps:
+      - name: Baixar codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pyparsing
+
+      - name: Verificar Tkinter e modulos
+        run: >
+          python -c "import tkinter, pyparsing;
+          import compiler_ast, lexer, preprocess, parser, semantic;
+          import codegen, optimizer, formatter, build_modes;
+          import assembler_cariri_adv;
+          print('Importacoes OK')"
+
+      - name: Gerar executavel
+        run: >
+          python -m PyInstaller
+          --noconfirm
+          --clean
+          --onefile
+          --windowed
+          --noupx
+          --name Gibao
+          --paths .
+          --hidden-import compiler_ast
+          --hidden-import lexer
+          --hidden-import preprocess
+          --hidden-import parser
+          --hidden-import semantic
+          --hidden-import codegen
+          --hidden-import optimizer
+          --hidden-import formatter
+          --hidden-import build_modes
+          --hidden-import assembler_cariri_adv
+          --hidden-import pyparsing
+          IDE_GCC.py
+
+      - name: Copiar biblioteca e exemplos
+        shell: python
+        run: |
+          from pathlib import Path
+          import shutil
+
+          dist = Path("dist")
+
+          if Path("stdlib").is_dir():
+              shutil.copytree(
+                  "stdlib",
+                  dist / "stdlib",
+                  dirs_exist_ok=True,
+              )
+
+          for example in Path(".").glob("exemplo*.c"):
+              shutil.copy2(example, dist / example.name)
+
+      - name: Compactar pacote Linux
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x dist/Gibao
+          tar -czf Gibao-linux-x86_64.tar.gz -C dist .
+
+      - name: Compactar pacote Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath Gibao-windows-x86_64.zip
+
+      - name: Disponibilizar pacote
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gibao-${{ matrix.platform }}
+          path: |
+            Gibao-${{ matrix.platform }}.tar.gz
+            Gibao-${{ matrix.platform }}.zip
+          if-no-files-found: error
+          retention-days: 30
